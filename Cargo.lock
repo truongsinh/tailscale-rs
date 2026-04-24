@@ -6026,6 +6026,7 @@ dependencies = [
  "tailscale",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
