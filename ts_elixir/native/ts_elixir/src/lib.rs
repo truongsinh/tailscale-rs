@@ -9,10 +9,12 @@ use std::{
 
 use rustler::{Encoder, NifResult, ResourceArc, Term};
 
+mod atomic_pid;
 mod config;
 mod tcp;
 mod udp;
 
+pub use atomic_pid::AtomicPid;
 use tcp::{TcpListener, TcpStream};
 use udp::UdpSocket;
 

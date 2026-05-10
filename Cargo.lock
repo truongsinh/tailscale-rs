@@ -6023,6 +6023,7 @@ name = "ts_elixir"
 version = "0.4.0"
 dependencies = [
  "rustler",
+ "static_assertions",
  "tailscale",
  "tokio",
  "tracing",

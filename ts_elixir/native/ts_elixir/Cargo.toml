@@ -15,6 +15,7 @@ rustler = "0.37.2"
 
 tailscale = { workspace = true }
 
+static_assertions.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 
