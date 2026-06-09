@@ -1,10 +1,16 @@
-use std::sync::Arc;
+use std::{
+    fmt::{Debug, Formatter},
+    sync::Arc,
+};
 
+use futures_util::StreamExt;
 use kameo::{
     actor::{ActorRef, Spawn},
-    message::{Context, Message},
+    message::{Context, Message, StreamMessage},
 };
 use ts_dataplane::async_tokio::{FromOverlay, FromUnderlay, Rx, ToOverlay, ToUnderlay, Tx};
+use ts_disco_protocol::{Packet, Plaintext};
+use ts_packet::PacketMut;
 use ts_transport::{OverlayTransportId, UnderlayTransportId};
 
 use crate::{
@@ -18,6 +24,7 @@ use crate::{
 
 pub struct DataplaneActor {
     dataplane: Arc<ts_dataplane::async_tokio::DataPlane>,
+    env: Env,
 }
 
 #[kameo::messages]
@@ -37,13 +44,56 @@ impl DataplaneActor {
     }
 }
 
+pub type DiscoPacket = yoke::Yoke<&'static Packet<Plaintext>, ts_packet::Packet>;
+
+#[derive(Clone)]
+pub struct Disco(pub DiscoPacket);
+
+impl Debug for Disco {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.get().fmt(f)
+    }
+}
+
+impl AsRef<Packet<Plaintext>> for Disco {
+    fn as_ref(&self) -> &Packet<Plaintext> {
+        self.0.get()
+    }
+}
+
+struct DiscoInternal(PacketMut);
+
+#[derive(Debug, Clone)]
+#[expect(dead_code)]
+pub struct Stun(pub ts_packet::Packet);
+
+struct StunInternal(PacketMut);
+
 impl kameo::Actor for DataplaneActor {
     type Args = Env;
     type Error = Error;
 
     async fn on_start(env: Self::Args, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let (dataplane, ..) = ts_dataplane::async_tokio::DataPlane::new(env.keys.node_keys.clone());
+        let (dataplane, disco, stun) =
+            ts_dataplane::async_tokio::DataPlane::new(env.keys.node_keys.clone());
+
         let dataplane = Arc::new(dataplane);
+
+        slf.attach_stream(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(disco)
+                .flat_map(tokio_stream::iter)
+                .map(DiscoInternal),
+            (),
+            (),
+        );
+
+        slf.attach_stream(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(stun)
+                .flat_map(tokio_stream::iter)
+                .map(StunInternal),
+            (),
+            (),
+        );
 
         env.subscribe::<PeerRouteUpdate>(&slf).await?;
         env.subscribe::<SelfRouteUpdate>(&slf).await?;
@@ -61,7 +111,63 @@ impl kameo::Actor for DataplaneActor {
         tracing::trace!("dataplane running");
         env.register(None, &slf).await?;
 
-        Ok(Self { dataplane })
+        Ok(Self { dataplane, env })
+    }
+}
+
+impl Message<StreamMessage<DiscoInternal, (), ()>> for DataplaneActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: StreamMessage<DiscoInternal, (), ()>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        let mut buf = match msg {
+            StreamMessage::Next(pkt) => pkt.0,
+            _ => return,
+        };
+
+        let pkt = match Packet::from_encrypted_bytes_mut(buf.as_mut()) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+                tracing::error!(error = %e, "parsing disco message");
+                return;
+            }
+        };
+
+        if let Err(e) = pkt.decrypt_in_place(&self.env.keys.disco_keys.private) {
+            tracing::error!(error = %e, "decrypting disco message");
+            return;
+        };
+
+        let pkt = yoke::Yoke::<&'static Packet<Plaintext>, _>::try_attach_to_cart(
+            buf.freeze(),
+            |buf| unsafe { Packet::from_bytes_unchecked(buf) },
+        )
+        .unwrap();
+        let pkt = Disco(pkt);
+
+        tracing::trace!(?pkt, "decrypted disco message");
+
+        self.env.publish_noretain(pkt).await.unwrap();
+    }
+}
+
+impl Message<StreamMessage<StunInternal, (), ()>> for DataplaneActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: StreamMessage<StunInternal, (), ()>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        let pkt = match msg {
+            StreamMessage::Next(pkt) => pkt.0,
+            _ => return,
+        };
+
+        self.env.publish_noretain(Stun(pkt.freeze())).await.unwrap();
     }
 }
 

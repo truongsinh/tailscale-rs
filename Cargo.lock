@@ -6280,6 +6280,7 @@ version = "0.4.0"
 dependencies = [
  "chrono",
  "futures",
+ "futures-util",
  "ipnet",
  "itertools",
  "kameo",
@@ -6300,6 +6301,7 @@ dependencies = [
  "ts_control",
  "ts_dataplane",
  "ts_derp",
+ "ts_disco_protocol",
  "ts_keys",
  "ts_netcheck",
  "ts_netmon",
@@ -6310,6 +6312,7 @@ dependencies = [
  "ts_packetfilter_state",
  "ts_transport",
  "ts_tunnel",
+ "yoke",
 ]
 
 [[package]]

@@ -16,6 +16,7 @@ ts_bart.workspace = true
 ts_bart_packetfilter.workspace = true
 ts_control.workspace = true
 ts_dataplane.workspace = true
+ts_disco_protocol.workspace = true
 ts_keys.workspace = true
 ts_netcheck.workspace = true
 ts_netmon.workspace = true
@@ -30,6 +31,7 @@ ts_tunnel.workspace = true
 
 # Unconditionally required dependencies.
 futures.workspace = true
+futures-util.workspace = true
 ipnet.workspace = true
 kameo = "0.21"
 kameo_actors = "0.6"
@@ -40,6 +42,7 @@ tokio-stream = { version = "0.1", default-features = false, features = ["time"] 
 tracing.workspace = true
 smallvec.workspace = true
 smol_str = "0.3"
+yoke.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
