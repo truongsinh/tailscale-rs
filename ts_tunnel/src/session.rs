@@ -228,22 +228,41 @@ pub struct BidiSession {
     send_id: SessionId,
     send_cipher: ChaCha20Poly1305,
     send_nonce: NonceGenerator,
-}
 
-pub struct BidiSessionKeys {
-    pub send_key: SessionKey,
-    pub send_id: SessionId,
-    pub recv_key: SessionKey,
-    pub recv_id: SessionId,
+    is_initiator: bool,
 }
 
 impl BidiSession {
-    pub fn new(keys: BidiSessionKeys, now: Instant) -> Self {
-        Self {
-            recv: ReceiveSession::new(keys.recv_key, keys.recv_id, now),
-            send_id: keys.send_id,
-            send_cipher: ChaCha20Poly1305::new(&keys.send_key),
-            send_nonce: Default::default(),
+    pub fn new(
+        keys: ts_noise::core::Session,
+        initiator_to_responder_id: SessionId,
+        responder_to_initiator_id: SessionId,
+        now: Instant,
+    ) -> Self {
+        if keys.is_initiator {
+            Self {
+                recv: ReceiveSession::new(
+                    keys.responder_to_initiator,
+                    responder_to_initiator_id,
+                    now,
+                ),
+                send_id: initiator_to_responder_id,
+                send_cipher: ChaCha20Poly1305::new(&keys.initiator_to_responder),
+                send_nonce: Default::default(),
+                is_initiator: true,
+            }
+        } else {
+            Self {
+                recv: ReceiveSession::new(
+                    keys.initiator_to_responder,
+                    initiator_to_responder_id,
+                    now,
+                ),
+                send_id: responder_to_initiator_id,
+                send_cipher: ChaCha20Poly1305::new(&keys.responder_to_initiator),
+                send_nonce: Default::default(),
+                is_initiator: false,
+            }
         }
     }
 
@@ -294,7 +313,7 @@ impl BidiSession {
     }
 
     pub fn stale(&self, now: Instant) -> bool {
-        now > self.rotation_time()
+        self.is_initiator && now > self.rotation_time()
     }
 }
 
@@ -552,12 +571,13 @@ mod tests {
         // same key in both directions, which leads to catastrophic nonce reuse. It's okay here
         // because (a) it's a test and (b) we only ever transmit in one direction.
         let send = BidiSession::new(
-            BidiSessionKeys {
-                send_key: k.into(),
-                send_id: session,
-                recv_key: k.into(),
-                recv_id: session,
+            ts_noise::core::Session {
+                initiator_to_responder: k.into(),
+                responder_to_initiator: k.into(),
+                is_initiator: true,
             },
+            session,
+            session,
             now,
         );
         let mut recv = ReceiveSession::new(k.into(), session, now);
@@ -617,21 +637,23 @@ mod tests {
             let sid1 = self.allocate_id();
             let sid2 = other.allocate_id();
             let s1 = BidiSession::new(
-                BidiSessionKeys {
-                    send_key: k1.into(),
-                    send_id: sid2,
-                    recv_key: k2.into(),
-                    recv_id: sid1,
+                ts_noise::core::Session {
+                    initiator_to_responder: k1.into(),
+                    responder_to_initiator: k2.into(),
+                    is_initiator: true,
                 },
+                sid2,
+                sid1,
                 now,
             );
             let s2 = BidiSession::new(
-                BidiSessionKeys {
-                    send_key: k2.into(),
-                    send_id: sid1,
-                    recv_key: k1.into(),
-                    recv_id: sid2,
+                ts_noise::core::Session {
+                    initiator_to_responder: k1.into(),
+                    responder_to_initiator: k2.into(),
+                    is_initiator: false,
                 },
+                sid2,
+                sid1,
                 now,
             );
             let (_, p1) = self.session.activate(s1, &mut self.ids, now, false);
@@ -717,7 +739,7 @@ mod tests {
         assert_eq!(b_to_a, packet("bar"));
 
         assert!(a.needs_handshake(now));
-        assert!(b.needs_handshake(now));
+        assert!(!b.needs_handshake(now));
 
         // Transmit with expired session.
         let now = now + Duration::from_secs(120);
@@ -840,12 +862,13 @@ mod tests {
         let id2 = SessionId::random();
 
         let bidi = BidiSession::new(
-            BidiSessionKeys {
-                send_key: k.into(),
-                send_id: id,
-                recv_key: k2.into(),
-                recv_id: id2,
+            ts_noise::core::Session {
+                initiator_to_responder: k.into(),
+                responder_to_initiator: k2.into(),
+                is_initiator: true,
             },
+            id,
+            id2,
             now,
         );
         assert!(!bidi.expired(now));

@@ -72,7 +72,7 @@ impl ReceivedHandshake {
             .mix_dh(&my_ephemeral.private, &self.peer_ephemeral_pub) // ee
             .mix_dh(&my_ephemeral.private, &self.peer_static_pub) // se
             .seal(&mut [], &mut response.auth_tag) // payload
-            .finish_as_responder()
+            .finish(false)
     }
 }
 
@@ -149,7 +149,7 @@ impl SentHandshake {
             .mix_dh(&my_static.private, &peer_ephemeral_pub) // se
             .open(&mut [], &packet.auth_tag)
             .ok_or(self)? // payload
-            .finish_as_initiator();
+            .finish(true);
 
         Ok(ret)
     }
@@ -206,7 +206,15 @@ mod tests {
             panic!("initiator failed to finalize handshake");
         };
 
-        assert_eq!(init_session.send, resp_session.recv);
-        assert_eq!(init_session.recv, resp_session.send);
+        assert_eq!(
+            init_session.initiator_to_responder,
+            resp_session.initiator_to_responder
+        );
+        assert_eq!(
+            init_session.responder_to_initiator,
+            resp_session.responder_to_initiator
+        );
+        assert!(init_session.is_initiator);
+        assert!(!resp_session.is_initiator);
     }
 }

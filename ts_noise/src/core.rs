@@ -39,9 +39,11 @@ fn must_hkdf<const N: usize>(chaining_key: &[u8; 32], key: &[u8]) -> [[u8; 32]; 
 /// A symmetric session.
 pub struct Session {
     /// The key to send data.
-    pub send: chacha20poly1305::Key,
+    pub initiator_to_responder: chacha20poly1305::Key,
     /// The key to receive data.
-    pub recv: chacha20poly1305::Key,
+    pub responder_to_initiator: chacha20poly1305::Key,
+    /// Whether the local endpoint initiated the handshake.
+    pub is_initiator: bool,
 }
 
 /// Base Noise handshake state.
@@ -117,27 +119,15 @@ impl State {
         }
     }
 
-    /// Finalize the handshake as the initiator role.
+    /// Finalize the handshake.
     ///
     /// This is the Split() operation in the Noise spec.
-    pub fn finish_as_initiator(self) -> Session {
-        let [send, recv] = must_hkdf(&self.chaining_key, &[]);
-
+    pub fn finish(self, is_initiator: bool) -> Session {
+        let [initiator_to_responder, responder_to_initiator] = must_hkdf(&self.chaining_key, &[]);
         Session {
-            send: send.into(),
-            recv: recv.into(),
-        }
-    }
-
-    /// Finalize the handshake as the responder role.
-    ///
-    /// This is the Split() operation in the Noise spec.
-    pub fn finish_as_responder(self) -> Session {
-        let [recv, send] = must_hkdf(&self.chaining_key, &[]);
-
-        Session {
-            send: send.into(),
-            recv: recv.into(),
+            initiator_to_responder: initiator_to_responder.into(),
+            responder_to_initiator: responder_to_initiator.into(),
+            is_initiator,
         }
     }
 }

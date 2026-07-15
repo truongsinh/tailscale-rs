@@ -57,8 +57,8 @@ impl Decoder for BiCodec {
 impl From<Session> for BiCodec {
     fn from(session: Session) -> Self {
         Self {
-            tx: Codec::<Tx>::from(session.send),
-            rx: Codec::<Rx>::from(session.recv),
+            tx: Codec::<Tx>::from(session.initiator_to_responder),
+            rx: Codec::<Rx>::from(session.responder_to_initiator),
         }
     }
 }
