@@ -619,135 +619,394 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
+    use zerocopy::TryFromBytes;
+
     use super::*;
-    use crate::config::PeerConfig;
+    use crate::{
+        config::PeerConfig,
+        messages::{HandshakeInitiation, TransportDataHeader},
+    };
+
+    struct TestEndpoint {
+        ep: Endpoint,
+        public: NodePublicKey,
+        next_peer_id: u32,
+    }
+
+    impl TestEndpoint {
+        pub fn new() -> Self {
+            let key = NodeKeyPair::new();
+            let public = key.public;
+            Self {
+                ep: Endpoint::new(key),
+                public,
+                next_peer_id: 0,
+            }
+        }
+
+        pub fn next_peer_id(&mut self) -> PeerId {
+            let ret = PeerId(self.next_peer_id);
+            self.next_peer_id += 1;
+            ret
+        }
+
+        pub fn add_peer(&mut self, other: &mut TestEndpoint) -> (PeerId, PeerId) {
+            let my_id = self.next_peer_id();
+            let other_id = other.next_peer_id();
+            let psk = rand::random();
+            assert!(
+                self.ep
+                    .upsert_peer(
+                        my_id,
+                        PeerConfig {
+                            key: other.public,
+                            psk,
+                        }
+                    )
+                    .is_none()
+            );
+            assert!(
+                other
+                    .ep
+                    .upsert_peer(
+                        other_id,
+                        PeerConfig {
+                            key: self.public,
+                            psk,
+                        }
+                    )
+                    .is_none()
+            );
+            (my_id, other_id)
+        }
+
+        pub fn send(
+            &mut self,
+            now: Instant,
+            packets: HashMap<PeerId, Vec<PacketMut>>,
+        ) -> SendResult {
+            self.ep.send(now, packets)
+        }
+
+        pub fn recv(&mut self, now: Instant, packets: Vec<PacketMut>) -> RecvResult {
+            self.ep.recv(now, packets)
+        }
+    }
+
+    enum PacketMatcher {
+        Any,
+        Exact(PacketMut),
+        Length(usize),
+        HandshakeInitiation,
+        HandshakeResponse,
+        TransportData,
+    }
+
+    impl PacketMatcher {
+        fn assert_matches(&self, packet: &PacketMut) {
+            match self {
+                PacketMatcher::Any => (),
+                PacketMatcher::Length(len) => assert_eq!(packet.len(), *len),
+                PacketMatcher::Exact(want) => assert_eq!(want, packet),
+                PacketMatcher::HandshakeInitiation => {
+                    HandshakeInitiation::try_ref_from_bytes(packet.as_ref()).unwrap();
+                }
+                PacketMatcher::HandshakeResponse => {
+                    HandshakeResponse::try_ref_from_bytes(packet.as_ref()).unwrap();
+                }
+                PacketMatcher::TransportData => {
+                    TransportDataHeader::try_ref_from_prefix(packet.as_ref()).unwrap();
+                }
+            }
+        }
+    }
+
+    const HANDSHAKE_INIT: PacketMatcher = PacketMatcher::HandshakeInitiation;
+    const HANDSHAKE_RESP: PacketMatcher = PacketMatcher::HandshakeResponse;
+    const ENCRYPTED: PacketMatcher = PacketMatcher::TransportData;
+
+    impl From<PacketMut> for PacketMatcher {
+        fn from(v: PacketMut) -> Self {
+            PacketMatcher::Exact(v)
+        }
+    }
+
+    impl From<usize> for PacketMatcher {
+        fn from(v: usize) -> Self {
+            PacketMatcher::Length(v)
+        }
+    }
+
+    impl From<()> for PacketMatcher {
+        fn from(_v: ()) -> Self {
+            PacketMatcher::Any
+        }
+    }
+
+    #[derive(Default)]
+    struct PacketMapMatcher(HashMap<PeerId, Vec<PacketMatcher>>);
+
+    impl PacketMapMatcher {
+        fn assert_matches(&self, packets: &HashMap<PeerId, Vec<PacketMut>>) {
+            for (id, packets) in packets.iter() {
+                let Some(matchers) = self.0.get(id) else {
+                    panic!("expected packets for {:?}, found none", id);
+                };
+                for (packet, matcher) in packets.iter().zip(matchers) {
+                    matcher.assert_matches(packet);
+                }
+            }
+            for id in self.0.keys() {
+                assert!(packets.contains_key(id));
+            }
+        }
+    }
+
+    macro_rules! packets {
+        ($($key:expr => [$($value:expr),*]),* $(,)?) => {
+            {
+                let mut m: HashMap<PeerId, Vec<PacketMut>> = Default::default();
+                $(m.insert($key, vec![$($value),*]);)*
+                m
+            }
+        };
+    }
+
+    macro_rules! assert_packets {
+        ($got:expr, {$($peer_id:expr => [$($matcher:expr),*]),* $(,)?}) => {
+            let mut m: PacketMapMatcher = Default::default();
+            $(m.0.insert($peer_id, vec![$(PacketMatcher::from($matcher)),*]);)*
+            m.assert_matches(&$got);
+        };
+    }
+
+    pub fn packet(v: u8) -> PacketMut {
+        PacketMut::from(vec![v; 4])
+    }
+
+    struct TestClock {
+        start: Instant,
+    }
+
+    impl TestClock {
+        pub fn new() -> Self {
+            Self {
+                start: Instant::now(),
+            }
+        }
+
+        pub fn at(&self, secs: u64) -> Instant {
+            self.start + Duration::from_secs(secs)
+        }
+    }
 
     #[test]
     fn test_one_peer() {
-        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
-        let psk = rand::random();
-        let now = Instant::now();
-
-        let (mut a_ep, mut b_ep) = (
-            Endpoint::new(a_static.clone()),
-            Endpoint::new(b_static.clone()),
-        );
-
-        let a_peer = PeerId(1);
-        let b_peer = PeerId(1);
-
-        assert!(
-            a_ep.upsert_peer(
-                a_peer,
-                PeerConfig {
-                    key: b_static.public,
-                    psk,
-                },
-            )
-            .is_none()
-        );
-
-        assert!(
-            b_ep.upsert_peer(
-                b_peer,
-                PeerConfig {
-                    key: a_static.public,
-                    psk,
-                },
-            )
-            .is_none()
-        );
-
-        let a_to_b_packets = [
-            PacketMut::from(vec![1, 2, 3, 4]),
-            PacketMut::from(vec![5, 6, 7, 8]),
-        ];
+        let (mut a, mut b) = (TestEndpoint::new(), TestEndpoint::new());
+        let t = TestClock::new();
+        let (b_id, a_id) = a.add_peer(&mut b);
 
         // A sends to B. Results in a handshake initiation being transmitted, not the
         // requested packet (which gets buffered internally by the endpoint).
-        let to_send = HashMap::from([(a_peer, Vec::from([a_to_b_packets[0].clone()]))]);
-        let a_acts = a_ep.send(now, to_send);
-        assert_eq!(
-            a_acts.to_peers.len(),
-            1,
-            "communicating with unexpected number of peers"
+        let a_acts = a.send(
+            t.at(0),
+            packets! {
+                b_id => [packet(1), packet(2)]
+            },
         );
-        let packets = a_acts
-            .to_peers
-            .get(&a_peer)
-            .expect("should have packets for A's peer");
-        assert_eq!(packets.len(), 1, "unexpected number of packets for peer");
+        assert_packets!(a_acts.to_peers, {
+            b_id => [HANDSHAKE_INIT],
+        });
 
-        // A sends another packet. No further activity, but pkt2 gets queued as well.
-        let to_send = HashMap::from([(a_peer, Vec::from([a_to_b_packets[1].clone()]))]);
-        let a_acts2 = a_ep.send(now, to_send);
-        assert_eq!(a_acts2, SendResult::default());
+        // A sends another packet. No activity on the wire.
+        let a_acts2 = a.send(
+            t.at(1),
+            packets! {
+                b_id => [packet(3)],
+            },
+        );
+        assert!(a_acts2.to_peers.is_empty());
 
         // B processes the handshake and responds. No packets delivered to B.
-        let b_acts = b_ep.recv(now, packets.clone());
-        assert_eq!(b_acts.to_local.len(), 0, "unexpected received message");
-        assert_eq!(
-            b_acts.to_peers.len(),
-            1,
-            "unexpected number of sent messages"
-        );
-        let packets = b_acts
-            .to_peers
-            .get(&b_peer)
-            .expect("should have packets for B's peer");
-        assert_eq!(packets.len(), 1, "unexpected packet count for B's peer");
+        let b_acts = b.recv(t.at(2), a_acts.to_peers[&b_id].clone());
+        assert!(b_acts.to_local.is_empty());
+        assert_packets!(b_acts.to_peers, {
+            a_id => [HANDSHAKE_RESP],
+        });
 
-        // A processes the response, and sends the two queued packets.
-        let a_acts3 = a_ep.recv(now, packets.clone());
-        assert_eq!(a_acts3.to_local.len(), 0, "unexpected received message");
-        assert_eq!(
-            a_acts3.to_peers.len(),
-            1,
-            "unexpected number of sent messages"
-        );
-        let packets = a_acts3
-            .to_peers
-            .get(&a_peer)
-            .expect("should have packets for A's peer");
-        assert_eq!(packets.len(), 2, "wrong number of packets for A's peer");
+        // A processes the response, and sends its queued packets.
+        let a_acts = a.recv(t.at(3), b_acts.to_peers[&a_id].clone());
+        assert!(a_acts.to_local.is_empty());
+        assert_packets!(a_acts.to_peers, {
+            b_id => [ENCRYPTED, ENCRYPTED, ENCRYPTED],
+        });
 
-        // B receives transport messages.
-        let b_acts = b_ep.recv(now, packets.clone());
-        assert_eq!(b_acts.to_local.len(), 1, "didn't receive message");
-        let packets = b_acts
-            .to_local
-            .get(&b_peer)
-            .expect("should have packets from B's peer");
-        assert_eq!(packets, &a_to_b_packets, "wrong packets received from A",);
-        assert_eq!(b_acts.to_peers.len(), 0, "unexpected sent message");
+        // B receives
+        let b_acts = b.recv(t.at(4), a_acts.to_peers[&b_id].clone());
+        assert_packets!(b_acts.to_local, {
+            a_id => [packet(1), packet(2), packet(3)],
+        });
+        assert!(b_acts.to_peers.is_empty());
 
-        // B sends transport message
-        let b_to_a_packet = PacketMut::from(vec![9, 10, 11, 12]);
-        let to_send = HashMap::from([(b_peer, vec![b_to_a_packet.clone()])]);
-        let b_acts = b_ep.send(now, to_send);
-        assert_eq!(
-            b_acts.to_peers.len(),
-            1,
-            "unexpected number of sent messages"
+        // B sends
+        let b_acts = b.send(
+            t.at(5),
+            packets! {
+                a_id => [packet(4)],
+            },
         );
-        let packets = b_acts
-            .to_peers
-            .get(&b_peer)
-            .expect("should have packets for B's peer");
-        assert_eq!(packets.len(), 1, "unexpected packet count for B's peer");
+        assert_packets!(b_acts.to_peers, {
+            a_id => [ENCRYPTED],
+        });
 
         // A receives
-        let a_acts = a_ep.recv(now, packets.clone());
-        assert_eq!(a_acts.to_local.len(), 1, "didn't receive message");
-        let packets = a_acts
-            .to_local
-            .get(&a_peer)
-            .expect("should have packets from A's peer");
-        assert_eq!(
-            packets,
-            &[b_to_a_packet],
-            "wrong packets received from A's peer"
+        let a_acts = a.recv(t.at(6), b_acts.to_peers[&a_id].clone());
+        assert_packets!(a_acts.to_local, {
+            a_id => [packet(4)],
+        });
+        assert!(a_acts.to_peers.is_empty());
+    }
+
+    #[test]
+    fn test_rotation_initiator() {
+        let (mut a, mut b) = (TestEndpoint::new(), TestEndpoint::new());
+        let t = TestClock::new();
+        let (b_id, a_id) = a.add_peer(&mut b);
+
+        // A sends a packet, which causes a handshake.
+        let a_acts = a.send(
+            t.at(0),
+            packets! {
+                b_id => [packet(1)],
+            },
         );
-        assert_eq!(a_acts.to_peers.len(), 0, "unexpected sent message");
+        assert_packets!(a_acts.to_peers, {
+            b_id => [HANDSHAKE_INIT],
+        });
+
+        let b_acts = b.recv(t.at(1), a_acts.to_peers[&b_id].clone());
+        assert!(b_acts.to_local.is_empty());
+        assert_packets!(b_acts.to_peers, {
+            a_id => [HANDSHAKE_RESP],
+        });
+
+        let a_acts = a.recv(t.at(2), b_acts.to_peers[&a_id].clone());
+        assert!(a_acts.to_local.is_empty());
+        assert_packets!(a_acts.to_peers, {
+            b_id => [ENCRYPTED],
+        });
+
+        let b_acts = b.recv(t.at(3), a_acts.to_peers[&b_id].clone());
+        assert_packets!(b_acts.to_local, {
+            a_id => [packet(1)],
+        });
+        assert!(b_acts.to_peers.is_empty());
+
+        // After session becomes stale, A sends a packet, causing a new handshake.
+        let a_acts = a.send(
+            t.at(121),
+            packets! {
+                b_id => [packet(2)],
+            },
+        );
+        assert_packets!(a_acts.to_peers, {
+            b_id => [ENCRYPTED, HANDSHAKE_INIT],
+        });
+
+        // B receives and processes new handshake in parallel
+        let b_acts = b.recv(t.at(122), a_acts.to_peers[&b_id].clone());
+        assert_packets!(b_acts.to_local, {
+            a_id => [packet(2)],
+        });
+        assert_packets!(b_acts.to_peers, {
+            a_id => [HANDSHAKE_RESP],
+        });
+
+        // A completes handshake, sends empty confirmation packet
+        let a_acts = a.recv(t.at(123), b_acts.to_peers[&a_id].clone());
+        assert!(a_acts.to_local.is_empty());
+        assert_packets!(a_acts.to_peers, {
+            b_id => [ENCRYPTED],
+        });
+
+        // B finalizes rotation.
+        let b_acts = a.recv(t.at(124), a_acts.to_peers[&b_id].clone());
+        assert!(b_acts.to_local.is_empty());
+        assert!(b_acts.to_peers.is_empty());
+    }
+
+    #[test]
+    fn test_rotation_responder() {
+        let (mut a, mut b) = (TestEndpoint::new(), TestEndpoint::new());
+        let t = TestClock::new();
+        let (b_id, a_id) = a.add_peer(&mut b);
+
+        // A sends a packet, which causes a handshake.
+        let a_acts = a.send(
+            t.at(0),
+            packets! {
+                b_id => [packet(1)],
+            },
+        );
+        assert_packets!(a_acts.to_peers, {
+            b_id => [HANDSHAKE_INIT],
+        });
+
+        let b_acts = b.recv(t.at(1), a_acts.to_peers[&b_id].clone());
+        assert!(b_acts.to_local.is_empty());
+        assert_packets!(b_acts.to_peers, {
+            a_id => [HANDSHAKE_RESP],
+        });
+
+        let a_acts = a.recv(t.at(2), b_acts.to_peers[&a_id].clone());
+        assert!(a_acts.to_local.is_empty());
+        assert_packets!(a_acts.to_peers, {
+            b_id => [ENCRYPTED],
+        });
+
+        let b_acts = b.recv(t.at(3), a_acts.to_peers[&b_id].clone());
+        assert_packets!(b_acts.to_local, {
+            a_id => [packet(1)],
+        });
+        assert!(b_acts.to_peers.is_empty());
+
+        // After session becomes stale, B sends a packet.
+        let b_acts = b.send(
+            t.at(121),
+            packets! {
+                a_id => [packet(2)],
+            },
+        );
+        assert_packets!(b_acts.to_peers, {
+            a_id => [ENCRYPTED],
+        });
+
+        // A receives and starts a new handshake.
+        let a_acts = a.recv(t.at(122), b_acts.to_peers[&a_id].clone());
+        assert_packets!(a_acts.to_local, {
+            b_id => [packet(2)],
+        });
+        assert_packets!(a_acts.to_peers, {
+            b_id => [HANDSHAKE_INIT],
+        });
+
+        // B processes new handshake.
+        let b_acts = b.recv(t.at(123), a_acts.to_peers[&b_id].clone());
+        assert!(b_acts.to_local.is_empty());
+        assert_packets!(b_acts.to_peers, {
+            a_id => [HANDSHAKE_RESP],
+        });
+
+        // A completes handshake, sends empty confirmation packet.
+        let a_acts = a.recv(t.at(124), b_acts.to_peers[&a_id].clone());
+        assert!(a_acts.to_local.is_empty());
+        assert_packets!(a_acts.to_peers, {
+            b_id => [ENCRYPTED],
+        });
+
+        // B finalizes handshake
+        let b_acts = b.recv(t.at(125), a_acts.to_peers[&b_id].clone());
+        assert!(b_acts.to_local.is_empty());
+        assert!(b_acts.to_peers.is_empty());
     }
 }
