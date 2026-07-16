@@ -12,6 +12,9 @@ policy file block is still not consulted.
 The server key is randomized on each start, so you will likely want to connect using
 `-o StrictHostKeyChecking=no`.
 
+Whether any of this belongs upstream is under discussion in
+[tailscale/tailscale-rs#285](https://github.com/tailscale/tailscale-rs/issues/285).
+
 ## Sessions have no pty
 
 `pty-req` is refused, so every session is pipe-backed:
