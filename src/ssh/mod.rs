@@ -28,7 +28,7 @@
 
 pub extern crate russh;
 
-use std::{fmt::Debug, net::SocketAddr, sync::Arc};
+use std::{fmt::Debug, net::SocketAddr, sync::Arc, time::Duration};
 
 use russh::server::Handler;
 
@@ -38,6 +38,21 @@ mod ratatui;
 
 pub use channel_server::{ChannelEvent, ChannelHandler, ChannelServer};
 pub use ratatui::{RatatuiApp, RatatuiEnv, RatatuiTerm};
+
+/// How long a connection has to complete the SSH handshake before it is dropped.
+///
+/// [`russh::server::run_stream`] writes the server's identification string and then waits
+/// for the client's, with no deadline of its own. A peer that opens a connection and never
+/// speaks therefore parks a task -- and the netstack socket it holds -- indefinitely. The
+/// netstack sets neither a keepalive nor a SYN-RECEIVED timeout, so nothing else reaps it
+/// either; only dropping the connection does, and dropping it is what this timeout forces.
+///
+/// Note what this deliberately does not do: cap how many handshakes may be in flight. A cap
+/// refuses connections once it is hit, and a refused connection is indistinguishable, from
+/// the client's side, from the lockout this timeout exists to prevent. Bounding the time a
+/// stalled handshake can hold its socket bounds the damage without ever turning a burst of
+/// unauthenticated traffic into a closed door for a legitimate one.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Trait to construct a new [`Handler`] from a Tailscale [`Device`][crate::Device] and
 /// the address of a connecting client.
@@ -70,25 +85,35 @@ impl crate::Device {
         tracing::info!(%listen_addr, "ssh server listening");
 
         loop {
+            // An error here is not per-connection: the listener is gone (its handle closed,
+            // or the netstack channel is shut), and every subsequent accept would fail the
+            // same way. Returning surfaces that; looping would spin on it forever.
             let conn = listener.accept().await?;
+            let remote = conn.remote_addr();
 
-            let handler = H::new_client(self.clone(), conn.remote_addr());
+            let handler = H::new_client(self.clone(), remote);
             let config = config.clone();
 
             tokio::task::spawn(async move {
-                let sess = match russh::server::run_stream(config, conn, handler).await {
-                    Ok(sess) => sess,
-                    Err(e) => {
-                        tracing::error!(error = ?e, "establishing session");
+                let handshake = russh::server::run_stream(config, conn, handler);
+
+                let sess = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                    Ok(Ok(sess)) => sess,
+                    // Neither arm is the server's problem: a peer that hangs up mid-handshake
+                    // or never speaks is routine on a reachable port, and logging it at error
+                    // buries real faults in noise from anything that scans or retries.
+                    Ok(Err(e)) => {
+                        tracing::debug!(%remote, error = ?e, "establishing session");
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        tracing::debug!(%remote, ?HANDSHAKE_TIMEOUT, "handshake timed out");
                         return;
                     }
                 };
 
-                match sess.await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::error!(error = ?e, "running ssh session");
-                    }
+                if let Err(e) = sess.await {
+                    tracing::debug!(%remote, error = ?e, "running ssh session");
                 }
             });
         }
