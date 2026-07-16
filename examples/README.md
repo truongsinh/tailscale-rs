@@ -37,3 +37,8 @@ A TCP server that listens on the tailnet and echoes input back to the sender.
 
 A TUI app served over an in-process SSH server which allows you to query info about peers on your
 tailnet.
+
+### [SSH Shell](ssh_shell)
+
+An in-process SSH server serving `exec` and `shell` sessions, authenticated against an
+`authorized_keys` file.
