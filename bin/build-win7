@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+#
+# Cross-build the workspace for `x86_64-win7-windows-gnu` from Linux, inside Docker.
+#
+# The Win7 target is Tier 3: rustup ships no prebuilt `std` for it, so we build our own with
+# `-Z build-std`, which in turn requires a nightly toolchain and the `rust-src` component.
+# Rather than force that toolchain on the host (the workspace pins stable in
+# rust-toolchain.toml), everything runs in the `rustlang/rust:nightly` image.
+#
+# Additional arguments are passed through to `cargo build`, e.g.:
+#
+#     $ bin/build-win7 --example ssh_shell
+#
+# builds just that example instead of the default scope.
+#
+# Artifacts land in target/x86_64-win7-windows-gnu/release/ (examples one level below that,
+# in examples/) and any .exe produced there is stripped in place. See docs/win7.md for
+# toolchain and runtime caveats.
+
+set -euo pipefail
+
+readonly TARGET=x86_64-win7-windows-gnu
+readonly IMAGE=${IMAGE:-rustlang/rust:nightly}
+readonly REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+readonly CARGO_ARGS=${@:---features ssh --lib}
+
+# Deliberately not `apt-get upgrade`: we want the image's pinned package set, plus these.
+#   gcc-mingw-w64-x86-64  the cross linker/runtime (`x86_64-w64-mingw32-gcc`, `-strip`)
+#   cmake, nasm, clang    needed by aws-lc-rs, which russh pulls in for its crypto
+readonly APT_DEPS="gcc-mingw-w64-x86-64 cmake nasm clang"
+
+docker run --rm -i \
+    -v "$REPO_ROOT:/src" \
+    -w /src \
+    -e RUSTUP_TOOLCHAIN=nightly \
+    -e CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+    -e TS_RS_BUILD_ARGS="$CARGO_ARGS" \
+    "$IMAGE" \
+    bash -euo pipefail -c '
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq '"$APT_DEPS"' >/dev/null
+
+        # Tier 3 has no prebuilt std; -Z build-std compiles it from these sources.
+        rustup component add rust-src --toolchain nightly
+
+        set -x
+        cargo build \
+            -Z build-std=std,panic_abort \
+            --target '"$TARGET"' \
+            --release \
+            $TS_RS_BUILD_ARGS
+
+        # The release profile sets `strip = true`, so this is a no-op for a default build --
+        # measured, not assumed. It is kept for builds under a profile that does not strip.
+        # Binaries land in release/, examples in release/examples/ -- but not the build
+        # scripts under release/build/, which are host artifacts we must not touch.
+        find target/'"$TARGET"'/release/ target/'"$TARGET"'/release/examples/ \
+                -maxdepth 1 -name "*.exe" -print0 2>/dev/null |
+            xargs -0 --no-run-if-empty x86_64-w64-mingw32-strip
+    '
+
+echo
+echo "artifacts in $REPO_ROOT/target/$TARGET/release:"
+find "$REPO_ROOT/target/$TARGET/release/" "$REPO_ROOT/target/$TARGET/release/examples/" \
+        -maxdepth 1 -name '*.exe' -printf '  %P\t%s bytes\n' 2>/dev/null || true

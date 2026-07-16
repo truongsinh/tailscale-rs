@@ -1,0 +1,5 @@
+[target.x86_64-win7-windows-gnu]
+# The Win7 target is Tier 3, so rustup ships no prebuilt std for it and the default linker
+# probing does not know about the mingw-w64 cross toolchain. Both the linker below and the
+# `-Z build-std` flag in bin/build-win7 are required; see docs/win7.md.
+linker = "x86_64-w64-mingw32-gcc"
