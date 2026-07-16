@@ -185,9 +185,18 @@ impl ShellServer {
             // ceremony than this example needs; report the shell's own convention instead.
             let code = status.code().unwrap_or(128) as u32;
 
-            tracing::info!(%channel, exit_status = code, "session finished");
+            // `status` is logged raw alongside the code we derive from it: a client that
+            // receives no exit-status message at all reports success, so "the client saw 0"
+            // and "the child exited 0" are indistinguishable from the client side. Only the
+            // server can tell them apart, and only if it says what it saw.
+            tracing::info!(%channel, ?status, exit_status = code, "session finished");
 
-            let _ = handle.exit_status_request(channel, code).await;
+            // Checked rather than ignored, for the same reason: silently dropping this
+            // message turns any failure into an exit 0 the client cannot question.
+            if handle.exit_status_request(channel, code).await.is_err() {
+                tracing::warn!(%channel, exit_status = code, "channel gone before exit status was sent");
+            }
+
             let _ = handle.eof(channel).await;
             let _ = handle.close(channel).await;
         });
