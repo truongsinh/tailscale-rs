@@ -132,24 +132,48 @@ pub fn spawn(install_dir: PathBuf, current_version: &'static str, manifest_url: 
             let sleep = jittered_sleep(poll_interval);
             time::sleep(sleep).await;
 
-            if let Err(e) = run_one_cycle(&install_dir, current_version, &manifest_url).await {
-                // Any error just logs and waits for the next cycle. The supervisor
-                // health-gate is the safety net for "binary swapped into a bad build";
-                // updater errors here are transient (network, parse, lock contention).
-                warn!(error = %e, "updater cycle failed; will retry next interval");
+            match run_one_cycle(&install_dir, current_version, &manifest_url).await {
+                Ok(CycleOutcome::NoUpdate) => {} // loop continues
+                Ok(CycleOutcome::Updated) => {
+                    // EXIT — supervisor relaunches within ~5 s (Windows supervisor.vbs)
+                    // or immediately (Linux systemd Restart=on-failure). The new
+                    // current-ssh-shell.txt points at the new binary.
+                    info!("update committed; exiting for supervisor relaunch");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    // Any error just logs and waits for the next cycle. The supervisor
+                    // health-gate is the safety net for "binary swapped into a bad build";
+                    // updater errors here are transient (network, parse, lock contention).
+                    warn!(error = %e, "updater cycle failed; will retry next interval");
+                }
             }
-            // A successful cycle calls process::exit(0) inside run_one_cycle.
         }
     });
 }
 
-/// One IDLE → FETCH → … → EXIT cycle. Returns Ok(()) for "no update needed" or
-/// "update staged + process about to exit." Returns Err for any transient failure.
-async fn run_one_cycle(
+/// Outcome of a single updater cycle. `Updated` means a new binary was staged +
+/// `current-ssh-shell.txt` was swapped + the caller should `process::exit(0)` so the
+/// supervisor relaunches the new file. `NoUpdate` means the manifest matched the
+/// running version (or was older) and the cycle is a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleOutcome {
+    /// Manifest version matched current — no action taken.
+    NoUpdate,
+    /// New binary staged + swap committed. Caller should exit for supervisor relaunch.
+    Updated,
+}
+
+/// One IDLE → FETCH → … → EXIT cycle. Returns `Ok(NoUpdate)` for "manifest matches
+/// current" or `Ok(Updated)` for "new binary staged + swap committed, caller should
+/// exit." Returns `Err` for any transient failure (network, parse, lock contention,
+/// sha256 mismatch). On `Updated`, the caller is expected to `process::exit(0)`;
+/// this function does NOT exit on its own so it remains unit-testable.
+pub(crate) async fn run_one_cycle(
     install_dir: &Path,
     current_version: &str,
     manifest_url: &str,
-) -> Result<(), UpdaterError> {
+) -> Result<CycleOutcome, UpdaterError> {
     // FETCH
     let resp = reqwest::get(manifest_url)
         .await
@@ -173,7 +197,7 @@ async fn run_one_cycle(
     // COMPARE
     if manifest.version == current_version {
         info!(version = current_version, "manifest version matches current; no update");
-        return Ok(());
+        return Ok(CycleOutcome::NoUpdate);
     }
     // MVP: string-different = update. We publish the manifest, so we won't push a
     // downgrade. TODO (follow-up): semver-aware no-downgrade check so a misconfigured
@@ -197,7 +221,7 @@ async fn run_one_cycle(
         Some(lock) => lock,
         None => {
             info!("other channel is mid-update; deferring to next cycle");
-            return Ok(());
+            return Ok(CycleOutcome::NoUpdate);
         }
     };
 
@@ -256,11 +280,9 @@ async fn run_one_cycle(
     // COMMIT
     commit_swap(install_dir, &stage_name).await?;
 
-    // EXIT — supervisor relaunches within ~5 s (Windows supervisor.vbs) or immediately
-    // (Linux systemd Restart=on-failure). The new current-ssh-shell.txt points at the
-    // new binary; the supervisor reads it on next launch.
-    info!("update committed; exiting for supervisor relaunch");
-    std::process::exit(0);
+    // DONE — caller (spawn loop) exits so the supervisor relaunches the new binary.
+    info!("update committed; ready for supervisor relaunch");
+    Ok(CycleOutcome::Updated)
 }
 
 /// Sleep duration: uniform in `[center - jitter_half, center + jitter_half)`.
@@ -621,5 +643,149 @@ mod tests {
         // Now acquire succeeds again.
         let g3 = acquire_lock(install).await.unwrap().unwrap();
         drop(g3);
+    }
+
+    // ── Integration test: full run_one_cycle with a mock HTTP server ──────────
+
+    /// Bind a ephemeral port for the mock server. Returned listener is passed to
+    /// `serve_mock` after the test builds the manifest with the known port.
+    async fn bind_mock_port() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    /// Minimal HTTP/1.1 server that serves two paths: `/manifest.json` and `/binary`.
+    /// Sets `Connection: close` so reqwest opens a fresh connection per request.
+    fn serve_mock(listener: tokio::net::TcpListener, manifest_json: String, binary: Vec<u8>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut reader = tokio::io::BufReader::new(&mut sock);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).await.ok();
+                // Consume remaining headers.
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).await.ok();
+                    if header.trim().is_empty() { break; }
+                }
+
+                if request_line.contains("GET /manifest.json") {
+                    let body = manifest_json.as_bytes().to_vec();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.ok();
+                    sock.write_all(&body).await.ok();
+                } else if request_line.contains("GET /binary") {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        binary.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.ok();
+                    sock.write_all(&binary).await.ok();
+                } else {
+                    sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.ok();
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn run_one_cycle_full_swap_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path();
+
+        // Seed: an "old" binary name in current-ssh-shell.txt.
+        atomic_write(&install.join(CURRENT_EXE_NAME), b"ssh_shell-old")
+            .await
+            .unwrap();
+
+        // "New" binary bytes (fake — just arbitrary bytes, content doesn't matter for
+        // the swap logic; what matters is the sha256 matches the manifest).
+        let new_binary_contents: Vec<u8> =
+            b"#!/bin/sh\necho fake new binary\n".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&new_binary_contents);
+        let new_sha = hex_encode(&hasher.finalize());
+
+        // Bind the port FIRST so we can build the manifest with the real URL.
+        let (listener, port) = bind_mock_port().await;
+        let binary_url = format!("http://127.0.0.1:{}/binary", port);
+        let manifest_url = format!("http://127.0.0.1:{}/manifest.json", port);
+
+        // Manifest advertising the new version, pointing at our mock /binary endpoint.
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "version": "0.4.0-NEW_FAKE",
+            "published_at": "2026-07-18T12:00:00Z",
+            "targets": {
+                current_target_triple(): {
+                    "url": binary_url,
+                    "sha256": new_sha,
+                    "size": new_binary_contents.len() as u64,
+                }
+            }
+        });
+
+        // Start serving.
+        serve_mock(listener, manifest.to_string(), new_binary_contents.clone());
+
+        // Run one cycle. Current version is "0.4.0-OLD" → manifest's "0.4.0-NEW_FAKE"
+        // differs → the full FETCH→DOWNLOAD→VERIFY→STAGE→COMMIT path should fire.
+        let outcome = run_one_cycle(install, "0.4.0-OLD", &manifest_url)
+            .await
+            .expect("cycle should succeed");
+
+        assert_eq!(outcome, CycleOutcome::Updated);
+
+        // current-ssh-shell.txt now points at the staged binary.
+        let current_name = fs::read_to_string(&install.join(CURRENT_EXE_NAME))
+            .await
+            .unwrap();
+        let current_name = current_name.trim();
+        assert!(
+            current_name.contains("0.4.0-NEW_FAKE"),
+            "current-ssh-shell.txt should contain the new version, got: {}",
+            current_name
+        );
+
+        // Rollback stack has the old name.
+        let stack = fs::read_to_string(&install.join(ROLLBACK_STACK_NAME))
+            .await
+            .unwrap();
+        assert_eq!(stack.trim(), "ssh_shell-old");
+
+        // The staged binary exists and matches the served bytes.
+        let staged_path = install.join(current_name);
+        let staged_bytes = fs::read(&staged_path).await.unwrap();
+        assert_eq!(staged_bytes, new_binary_contents);
+    }
+
+    #[tokio::test]
+    async fn run_one_cycle_no_update_when_versions_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path();
+
+        let (listener, port) = bind_mock_port().await;
+        let manifest_url = format!("http://127.0.0.1:{}/manifest.json", port);
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "version": "0.4.0-SAME",
+            "published_at": "2026-07-18T12:00:00Z",
+            "targets": {}
+        });
+        serve_mock(listener, manifest.to_string(), vec![]);
+
+        let outcome = run_one_cycle(install, "0.4.0-SAME", &manifest_url)
+            .await
+            .expect("cycle should succeed");
+
+        assert_eq!(outcome, CycleOutcome::NoUpdate);
+        // current-ssh-shell.txt should NOT exist (we never wrote it).
+        assert!(!install.join(CURRENT_EXE_NAME).exists());
     }
 }
