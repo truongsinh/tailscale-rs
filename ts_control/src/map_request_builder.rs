@@ -26,18 +26,21 @@ pub(crate) fn go_arch(arch: &str) -> &str {
 }
 
 /// The composed `ipn_version` string reported to control, of the form
-/// `"<pkg>-<sha> <goarch> run=<identity>"` (e.g. `"0.4.0-abc1234 amd64 run=user:sinh"`).
+/// `"<pkg>-<seq>-g<sha> <goarch> run=<identity> disk=<free%>/<freeGB>"`
+/// (e.g. `"0.4.0-253-g301ee7a amd64 run=user:sinh disk=29%/169GB"`).
 ///
-/// The admin console surfaces `clientVersion` (this value) but not `app`, so the goarch and
-/// run-identity are folded in here to make them observable. Cached for the process lifetime.
+/// The admin console surfaces `clientVersion` (this value) but not `app`, so the goarch,
+/// run-identity, and disk summary are folded in here to make them observable. Cached for
+/// the process lifetime.
 fn ipn_version() -> &'static str {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| {
         format!(
-            "{} {} {}",
+            "{} {} {} {}",
             crate::IPN_VERSION,
             go_arch(std::env::consts::ARCH),
             crate::run_identity::run_identity(),
+            crate::disk_identity::disk_identity(),
         )
     })
 }
@@ -190,6 +193,10 @@ mod tests {
         assert!(
             composed.contains(" run="),
             "composed ipn_version {composed:?} should carry a run= identity token",
+        );
+        assert!(
+            composed.contains(" disk="),
+            "composed ipn_version {composed:?} should carry a disk= summary token",
         );
         assert!(
             composed.contains(goarch),

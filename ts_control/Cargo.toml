@@ -46,9 +46,10 @@ futures-util = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-stream = { version = "0.1", optional = true, default-features = false, features = ["sync"] }
 
-# Run-as identity detection (see run_identity.rs).
+# Run-as identity + disk-free detection (see run_identity.rs / disk_identity.rs).
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["user"] }
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -56,6 +57,7 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
+    "Win32_Storage_FileSystem",
 ] }
 
 [features]

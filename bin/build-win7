@@ -24,6 +24,12 @@ readonly IMAGE=${IMAGE:-rustlang/rust:nightly}
 readonly REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly CARGO_ARGS=${@:---features ssh --lib}
 
+# Bake the git describe-style identity into the binary so the admin console's
+# `clientVersion` is always traceable to a specific commit (never "unknown").
+# Resolved at the host so the Docker invocation stays read-only and reproducible.
+readonly TS_RS_BUILD_SHA=$(git -C "$REPO_ROOT" rev-parse --short HEAD)
+readonly TS_RS_BUILD_SEQ=$(git -C "$REPO_ROOT" rev-list --count HEAD)
+
 # Deliberately not `apt-get upgrade`: we want the image's pinned package set, plus these.
 #   gcc-mingw-w64-x86-64  the cross linker/runtime (`x86_64-w64-mingw32-gcc`, `-strip`)
 #   cmake, nasm, clang    needed by aws-lc-rs, which russh pulls in for its crypto
@@ -35,7 +41,8 @@ docker run --rm -i \
     -e RUSTUP_TOOLCHAIN=nightly \
     -e CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
     -e TS_RS_BUILD_ARGS="$CARGO_ARGS" \
-    -e TS_RS_BUILD_SHA \
+    -e TS_RS_BUILD_SHA="$TS_RS_BUILD_SHA" \
+    -e TS_RS_BUILD_SEQ="$TS_RS_BUILD_SEQ" \
     "$IMAGE" \
     bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive

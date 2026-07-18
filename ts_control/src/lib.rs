@@ -3,12 +3,19 @@
 extern crate alloc;
 
 /// The version this client reports to control in `HostInfo.ipn_version`, in the "long format"
-/// control expects: the cargo package version joined with the build SHA, e.g. `0.4.0-abc1234`.
+/// control expects: the cargo package version joined with a git-describe style ordinal + SHA,
+/// e.g. `0.4.0-253-g301ee7a`.
 ///
-/// `TS_RS_BUILD_SHA` is baked in by `build.rs` (falling back to `unknown` when unset). The
-/// goarch and run-identity are folded on top of this at request-build time; see
-/// [`map_request_builder`].
-pub const IPN_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-", env!("TS_RS_BUILD_SHA"));
+/// `TS_RS_BUILD_SHA` and `TS_RS_BUILD_SEQ` are baked in by `build.rs` (falling back to
+/// `unknown` / `0` when unset). The goarch, run-identity and disk-free are folded on top of
+/// this at request-build time; see [`map_request_builder`].
+pub const IPN_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "-",
+    env!("TS_RS_BUILD_SEQ"),
+    "-g",
+    env!("TS_RS_BUILD_SHA"),
+);
 
 mod config;
 mod control_dialer;
@@ -18,6 +25,7 @@ mod dial_plan;
 mod map_request_builder;
 mod node;
 mod run_identity;
+mod disk_identity;
 #[cfg(feature = "async_tokio")]
 mod tokio;
 

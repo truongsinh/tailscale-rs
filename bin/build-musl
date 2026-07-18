@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# Cross-build the workspace for `x86_64-unknown-linux-musl` (fully-static) inside
+# Docker, so a fleet box with a different libc (or no libc at all — scratch
+# containers) can run the resulting binary without a glibc match.
+#
+# `musl` is Tier 2: rustup ships a prebuilt `std`, so we do NOT need
+# `-Z build-std` / nightly — the workspace's stable toolchain works. We still
+# build in the `rustlang/rust:nightly` image for fleet-build uniformity with
+# `bin/build-win7`: one toolchain image to cache, one apt-install dance, one
+# path for the version-embed env vars.
+#
+# Additional arguments are passed through to `cargo build`, e.g.:
+#
+#     $ bin/build-musl --example ssh_shell --features ssh
+#
+# Artifacts land in target/x86_64-unknown-linux-musl/release/ (examples one
+# level below that, in examples/) and any ELF produced there is stripped in
+# place. See `.doc/2026-07-fleet-self-update.md` for the fleet layout.
+
+set -euo pipefail
+
+readonly TARGET=x86_64-unknown-linux-musl
+readonly IMAGE=${IMAGE:-rustlang/rust:nightly}
+readonly REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+readonly CARGO_ARGS=${@:---features ssh --lib}
+
+# Bake the git describe-style identity into the binary so the admin console's
+# `clientVersion` is always traceable to a specific commit (never "unknown").
+# Resolved at the host so the Docker invocation stays read-only and reproducible.
+readonly TS_RS_BUILD_SHA=$(git -C "$REPO_ROOT" rev-parse --short HEAD)
+readonly TS_RS_BUILD_SEQ=$(git -C "$REPO_ROOT" rev-list --count HEAD)
+
+# Deliberately not `apt-get upgrade`: we want the image's pinned package set, plus:
+#   musl-tools   the musl-gcc cross wrapper (`x86_64-linux-musl-gcc`, `-strip`)
+#   cmake, nasm, clang    needed by aws-lc-rs, which russh pulls in for its crypto
+#   make         aws-lc-rs / openssl-sys bring their own Makefile builds
+readonly APT_DEPS="musl-tools cmake nasm clang make perl"
+
+# The `CC_x86_64_unknown_linux_musl` / `CARGO_TARGET_*_LINKER` envs point the
+# build at musl-gcc; the `rustlang/rust:nightly` image doesn't ship it, hence
+# the apt install below.
+docker run --rm -i \
+    -v "$REPO_ROOT:/src" \
+    -w /src \
+    -e RUSTUP_TOOLCHAIN=nightly \
+    -e CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+    -e CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc \
+    -e TS_RS_BUILD_ARGS="$CARGO_ARGS" \
+    -e TS_RS_BUILD_SHA="$TS_RS_BUILD_SHA" \
+    -e TS_RS_BUILD_SEQ="$TS_RS_BUILD_SEQ" \
+    "$IMAGE" \
+    bash -euo pipefail -c '
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq '"$APT_DEPS"' >/dev/null
+
+        rustup target add '"$TARGET"' --toolchain nightly
+
+        set -x
+        cargo build \
+            --target '"$TARGET"' \
+            --release \
+            $TS_RS_BUILD_ARGS
+
+        # The release profile sets `strip = true`, so this is a no-op for a default
+        # build — measured, not assumed. Kept for builds under a profile that does
+        # not strip. Binaries land in release/, examples in release/examples/ --
+        # but not the build scripts under release/build/, which are host artifacts
+        # we must not touch.
+        find target/'"$TARGET"'/release/ target/'"$TARGET"'/release/examples/ \
+                -maxdepth 1 -type f -perm -u+x -print0 2>/dev/null |
+            xargs -0 --no-run-if-empty strip --strip-debug
+    '
+
+echo
+echo "artifacts in $REPO_ROOT/target/$TARGET/release:"
+find "$REPO_ROOT/target/$TARGET/release/" "$REPO_ROOT/target/$TARGET/release/examples/" \
+        -maxdepth 1 -type f -perm -u+x -printf '  %P\t%s bytes\n' 2>/dev/null || true
