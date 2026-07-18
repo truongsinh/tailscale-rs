@@ -265,3 +265,7 @@ required-features = ["ssh"]
 [[example]]
 name = "ssh_shell"
 required-features = ["ssh"]
+
+[[test]]
+name = "exec_stdin_integrity"
+required-features = ["ssh"]
