@@ -1,153 +1,131 @@
-# Supervisor-restart interface — Bravo (P1 watchdog) × Charlie (P4 updater)
+# Supervisor-restart × in-process-recovery interface — Bravo (P1) × Charlie (P4)
 
-> Tight contract for the ONE shared thing both features need: asking the
-> supervisor to restart the ssh_shell process safely. Extract from
-> [2026-07-fleet-self-update.md](2026-07-fleet-self-update.md) §4, refined
-> to cover Bravo's in-process-fallback path. Bravo implements against this;
-> Charlie's updater conforms to it.
+> Tight contract for the NARROW shared surface between Bravo's in-process
+> watchdog (control-stream reconnect + DERP relay rehome) and Charlie's
+> supervisor-level process restart (self-update swap). Bravo's mechanism
+> runs ENTIRELY in-process; Charlie's restarts the process via the
+> supervisor. The surface they share is small — keep it small, don't
+> over-couple.
+>
+> Source design: [2026-07-fleet-self-update.md](2026-07-fleet-self-update.md).
+> Background on Bravo's design (redsun smoking gun: `active; relay "dfw",
+> tx 2808 rx 0`): tailscale-rs-autonomous-run board, sections
+> "SHARPEST DIAGNOSTIC" + "P1 ROOT-CAUSE REFINED".
 
-## 1. Two restart mechanisms — do NOT conflate
+## 1. Two mechanisms — distinct, NOT coupled
 
-| Feature | What restarts | Why | Where the logic lives |
-|---|---|---|---|
-| **Bravo P1 — off-tailnet watchdog** | The SAME binary, in-process | DERP/control stream stalled; recover without losing SSH sessions | `ts_runtime/src/offtailnet_watchdog.rs` (in-process); falls back to process restart ONLY if in-process recovery exhausts |
-| **Charlie P4 — fleet self-update** | A NEW binary file, via supervisor relaunch | A manifest-versioned update is staged; current process exits cleanly so supervisor picks up the new filename | `examples/ssh_shell/updater.rs` (in-process) triggers exit; supervisor (`run-node.cmd`/`supervisor.vbs`/`run.sh`/schtasks/systemd) does the relaunch |
+| Feature | What it does | Trigger | Where the logic lives | Restarts process? |
+|---|---|---|---|---|
+| **Bravo P1 — off-tailnet watchdog** | Control-stream RECONNECT (re-attach on `StreamMessage::Finished`, 5 s backoff) + rx-stall DERP relay REHOME (self-heal re-selects region after fresh `derp_map`) | No `StateUpdate` for >120 s OR rx stall (`tx > 0, rx ≈ 0`) | `ts_runtime/src/offtailnet_watchdog.rs` (in-process actor); ControlRunner `ForceReconnect` msg | **NO** — preserves live SSH sessions (the whole point) |
+| **Charlie P4 — fleet self-update** | Atomic exe swap via supervisor relaunch on clean exit | Manifest version newer than current | `examples/ssh_shell/updater.rs` (in-process) triggers `process::exit(0)`; supervisor relaunches the new filename | **YES** — supervisor (`run-node.cmd` / `supervisor.vbs` / `run.sh` / systemd) picks up `current-ssh-shell.txt` |
 
-The supervisor-side restart path is **shared**. The trigger + post-restart
-decision differ:
+**Key boundary:** Bravo never touches the supervisor. Bravo's watchdog
+runs inside the ssh_shell process; if it recovers (expected case on
+redsun), the supervisor sees nothing. If Bravo's watchdog cannot recover
+in-process, the binary stays running (unhealthy) — it does NOT write a
+sentinel, does NOT request a process restart. Process restart remains
+Charlie's domain (clean exit for swap) or plain crash recovery
+(supervisor's default `Restart=on-failure`).
 
-- Bravo triggers it as a LAST RESORT (in-process recovery failed).
-- Charlie triggers it as the HAPPY PATH (clean exit → relaunch picks up new file).
-- After relaunch, the supervisor runs the SAME health-gate loop. The gate decides "rollback to previous file" based on whether the boot record indicates a version change — not based on who triggered the restart.
+## 2. The truly-shared surface (small)
 
-## 2. State files — single owner per file
+Two invariants in the binary's boot path. Both features depend on them;
+neither feature owns them — `examples/ssh_shell/main.rs` owns them.
 
-| File | Owner (writes) | Readers | Purpose |
-|---|---|---|---|
-| `current-ssh-shell.txt` | supervisor (under health-gate) | supervisor, both binaries | Exe filename to launch. Default `ssh_shell.exe` (Windows) / `ssh_shell-selfheal` (Linux). |
-| `.boot-state.json` | **the launched binary** (Charlie writes; Bravo's binary writes the same on every boot — there is one boot path) | supervisor gate | `{booted_at, version, target_ip}`. The gate's rollback trigger keys off `booted_at` age vs. process-alive. |
-| `.rollback-stack.txt` | supervisor (under health-gate) | supervisor | LIFO of up to 3 previous exe filenames. Pop = revert. |
-| `.koidra-ssh-update.lock` | Charlie's updater only | Charlie's updater | Per-box advisory lock so both channels don't swap simultaneously. Bravo's watchdog does NOT touch this. |
-| `.restart-requested` (sentinel) | Bravo's watchdog ONLY (fallback path) | supervisor gate (next cycle) | Empty file; presence = "watchdog exhausted in-process recovery, please restart the process". Unlink by supervisor after relaunch. |
+### 2.1 `.boot-state.json` (single boot-path write)
 
-Bravo's watchdog otherwise NEVER touches `current-ssh-shell.txt`,
-`.rollback-stack.txt`, or `.koidra-ssh-update.lock`. It operates on the
-in-process control runner; only on fallback does it drop the sentinel.
+On launch, before doing anything that could hang or take >2 s, the binary writes `.boot-state.json` in the install dir:
 
-## 3. Binary boot contract (what `main.rs` MUST do)
-
-On launch, before doing anything that could hang or take >2 s, the binary:
-
-1. Compute `target_ip = dev.ipv4_addr()` (already required for `serve_ssh`).
-2. Atomically write `.boot-state.json` in the install dir:
-   ```json
-   {"booted_at":"2026-07-18T12:34:56Z","version":"0.4.0-d897332","target_ip":"100.115.1.3"}
-   ```
-   temp+rename, single shot. `version` = the same `IPN_VERSION` string already logged.
-3. Open the SSH listen socket **first** (before DERP/control registration) — that's what the gate probes. (`dev.serve_ssh(...)` already does this if invoked before any blocking await; keep that ordering.)
-4. Delete `.boot-state.json` after EITHER (a) first successful SSH accept, OR (b) 5 min of healthy operation, whichever first. This is the "I'm alive" signal.
-5. NEVER delete `.koidra-ssh-update.lock` — that's the supervisor's responsibility (after the gate clears).
-6. NEVER delete `.restart-requested` — that's the supervisor's responsibility (after relaunch).
-
-Steps 1-4 are SHARED — every boot does them, regardless of whether the
-trigger was Bravo's watchdog fallback or Charlie's update exit or a manual
-restart. This is what makes the gate work uniformly.
-
-## 4. Supervisor health-gate loop (single shared algorithm)
-
-Runs every supervisor cycle (Windows `supervisor.vbs` ≈ 5 s; systemd `Restart=on-failure`).
-
-```
-inputs:  current-ssh-shell.txt, .boot-state.json, .rollback-stack.txt, .restart-requested
-
-1. read current-ssh-shell.txt -> EXE  (default if missing)
-2. if .boot-state.json does NOT exist from a PRIOR launch with same EXE:
-       # fresh launch of this EXE — baseline its health
-       record baseline={exe: EXE, started: now}
-   else:
-       # still working through a prior launch's gate cycle
-       prior = read .boot-state.json
-       if now - prior.booted_at < HEALTH_GATE_SECS (60):
-           continue supervision (process may still be coming up)
-       elif process still alive AND listen socket open:
-           # late but healthy — clear baseline, stop gating
-           clear baseline
-       elif process exited:
-           # FAILED within the gate window — decide rollback
-           if .restart-requested exists:
-               # Bravo fallback: restart SAME exe, no rollback-stack pop
-               unlink .restart-requested
-               relaunch EXE
-               baseline = {exe: EXE, started: now}
-           elif baseline.exe == EXE AND .rollback-stack.txt non-empty:
-               # Charlie update path: new exe failed gate, revert
-               pop top of rollback-stack -> PREV_EXE
-               write PREV_EXE to current-ssh-shell.txt
-               relaunch PREV_EXE
-               baseline = {exe: PREV_EXE, started: now}
-               enter COOLDOWN (1 h) — stop accepting updater exits
-           else:
-               # Same exe, no rollback candidate, no explicit request = plain crash loop
-               # systemd: give up (StartLimitBurst). Windows: stop supervisor for COOLDOWN.
-               enter COOLDOWN
-       else:
-           # process alive but not healthy at 60s — leave alone (slow reg)
-           pass
-3. else (normal supervision):
-       just relaunch on crash
+```json
+{"schema":1,"booted_at":"2026-07-18T12:34:56Z","version":"0.4.0-d897332","target_ip":"100.115.1.3"}
 ```
 
-Three trigger sources, one algorithm:
+- temp+rename (atomic), single shot at boot.
+- `version` = the same `IPN_VERSION` string already logged by main.rs.
+- `target_ip` = `dev.ipv4_addr()` (already computed for `serve_ssh`).
+- Deleted by the binary after EITHER first successful SSH accept OR 5 min of healthy operation, whichever is first.
 
-| Trigger | Sentinel | Rollback-stack pop? |
+**Who reads it:**
+- Charlie's supervisor health-gate (§3) — to detect "fresh launch failed within 60 s".
+- Bravo's watchdog MAY read it (informational: "I booted at T, version V"). Bravo does NOT write it, does NOT delete it, does NOT depend on its absence/presence for its in-process logic.
+
+### 2.2 Listen-socket-early invariant
+
+The binary MUST open the SSH listen socket BEFORE DERP/control registration. Today `dev.serve_ssh(...)` already does this — keep that ordering.
+
+- Charlie's supervisor gate probes the TCP port to decide if a freshly-launched exe is healthy.
+- Bravo benefits indirectly: a reachable listen socket means SSH sessions survive even while Bravo's watchdog is mid-recovery on the control plane.
+
+That's the whole shared surface. Nothing else is shared.
+
+## 3. Charlie's supervisor health-gate (Bravo-independent)
+
+For completeness — this is Charlie's domain; Bravo doesn't interact with it.
+
+State files in install dir:
+
+| File | Owner (writes) | Purpose |
 |---|---|---|
-| Bravo watchdog fallback | `.restart-requested` present | NO — restart same exe |
-| Charlie updater clean exit | none (exit code 0) | supervisor relaunches current-ssh-shell.txt; if that's the NEW exe and it fails the gate → pop (revert). If it's the SAME exe (no update in flight) → no pop. |
-| Manual kill / OOM | none | Same as Bravo (no rollback pop, same-exe restart) |
+| `current-ssh-shell.txt` | supervisor (under gate) | Exe filename to launch. Default `ssh_shell.exe` (Win) / `ssh_shell-selfheal` (Linux). |
+| `.rollback-stack.txt` | supervisor (under gate) | LIFO of up to 3 previous exe filenames; pop = revert. |
+| `.koidra-ssh-update.lock` | Charlie's updater only | Per-box advisory lock so both channels don't swap simultaneously. |
 
-The distinguishing signal is `baseline.exe == EXE AND exe was just swapped
-(booted_at within last cycle)`. In practice: the supervisor updates
-`baseline.exe` whenever `current-ssh-shell.txt` changes value, so a
-mismatch on a fresh boot = "we just swapped into a new exe" = rollback
-eligible.
-
-## 5. Bravo watchdog → supervisor fallback (the integration point)
+Gate algorithm (per supervisor cycle, ~5 s on Windows; systemd `Restart=on-failure`):
 
 ```
-offtailnet_watchdog (in-process, 30 s tick):
-  if no StateUpdate for > TS_OFFNET_T_DETECT_SECS (120):
-      attempt ForceReconnect on ControlRunner
-      if ForceReconnect fails OR no StateUpdate within COOLDOWN (60 s):
-          # in-process recovery exhausted
-          log "watchdog fallback: requesting supervisor restart"
-          touch .restart-requested   # empty file, install dir
-          process::exit(libc::EXIT_FAILURE)   # supervisor sees abnormal exit
+1. read current-ssh-shell.txt -> EXE  (default if missing)
+2. track baseline = {exe launched, boot timestamp from .boot-state.json}
+3. on process exit within HEALTH_GATE_SECS (60) of a fresh baseline:
+     if baseline.exe was JUST swapped (current-ssh-shell.txt changed last cycle)
+        AND .rollback-stack.txt non-empty:
+        pop top -> PREV_EXE
+        write PREV_EXE to current-ssh-shell.txt
+        relaunch PREV_EXE
+        enter COOLDOWN (1 h)
+     else:
+        relaunch same EXE (plain crash recovery, default systemd behavior)
+4. on healthy launch (process alive at 60 s + listen socket open):
+     clear baseline, stop gating
+5. at 60 s if process alive but listen not open: leave alone (slow reg)
 ```
 
-Why this shape:
-- The watchdog's FIRST job is to recover in-process — preserves live SSH sessions (the whole point of P1).
-- Only when in-process recovery provably fails does it escalate. The escalation is a process exit (abnormal) + a sentinel that tells the supervisor "I asked for this, don't roll back".
-- Supervisor's gate sees: process exited + sentinel present → relaunch same exe + clear sentinel. No rollback-stack pop.
-- If Bravo's in-process fix is sufficient on the real redsun box (it likely is — the smoking-gun diagnostic says the issue is control-stream-drop, recoverable in-process), the fallback path is never taken and the supervisor never even notices.
+Single trigger source for Charlie's gate: the binary exits. Two outcomes
+depending on whether `current-ssh-shell.txt` just changed (Charlie's
+update path → rollback eligible) or not (plain crash → restart same
+exe). No Bravo interaction.
 
-## 6. What Bravo must implement (checklist)
+## 4. What Bravo must implement (checklist)
 
-- [ ] `ts_runtime/src/offtailnet_watchdog.rs` — the in-process actor (main's design).
+- [ ] `ts_runtime/src/offtailnet_watchdog.rs` — in-process actor (30 s tick).
 - [ ] ControlRunner `ForceReconnect` msg + `StreamMessage::Finished` handler with 5 s backoff.
-- [ ] Fallback: `touch .restart-requested` in the install dir, then `process::exit(EXIT_FAILURE)`.
-- [ ] DO NOT touch `current-ssh-shell.txt`, `.rollback-stack.txt`, `.koidra-ssh-update.lock` — Charlie/supervisor owns those.
-- [ ] Honor the binary boot contract §3 — Bravo's in-process watchdog runs AFTER boot-state.json is written (which the binary does once at startup, not Bravo specifically).
+- [ ] rx-stall detection (`tx > 0, rx ≈ 0` for T) triggering self-heal DERP rehome via fresh `derp_map`.
+- [ ] Honor the listen-socket-early invariant (§2.2) — do not move the listen socket later in the boot path.
+- [ ] DO NOT write `current-ssh-shell.txt`, `.rollback-stack.txt`, `.koidra-ssh-update.lock`, `.restart-requested`, or any sentinel file in the install dir. Bravo's recovery is in-process ONLY.
+- [ ] DO NOT call `process::exit` from the watchdog. If recovery exhausts, log loudly and keep the process running — Charlie's supervisor handles process-level recovery via plain crash detection if the binary later dies on its own.
 
-## 7. What Charlie must implement (checklist, post-Bravo-merge)
+## 5. What Charlie must implement (checklist, post-Bravo-merge)
 
-- [ ] `examples/ssh_shell/updater.rs` — manifest fetch + compare + download + sha256 + stage + swap current-ssh-shell.txt + exit 0.
-- [ ] `examples/ssh_shell/main.rs` — parse `--manifest-url`, `tokio::spawn` the updater task after `Device::new`, write `.boot-state.json` before `serve_ssh`.
+- [ ] `examples/ssh_shell/updater.rs` — manifest fetch + compare + download + sha256 + stage + swap `current-ssh-shell.txt` + `process::exit(0)`.
+- [ ] `examples/ssh_shell/main.rs`:
+  - parse `--manifest-url`, `tokio::spawn` the updater task after `Device::new`.
+  - write `.boot-state.json` before `serve_ssh` (single boot-path write, §2.1).
+  - ensure listen-socket-early ordering is preserved when adding updater task (§2.2).
 - [ ] Per-box lockfile `.koidra-ssh-update.lock` (create_new atomic).
-- [ ] Supervisor updates (live in `koidra-ssh-fleet/`): `run-node.cmd` reads `current-ssh-shell.txt`; `supervisor.vbs` runs the §4 gate loop; same for `run.sh`/systemd on Linux.
-- [ ] Canary plan §9 of the main design doc.
+- [ ] Supervisor updates (live in `koidra-ssh-fleet/`): `run-node.cmd` reads `current-ssh-shell.txt`; `supervisor.vbs` runs the §3 gate loop; same for `run.sh`/systemd on Linux.
 
-## 8. Drift guards
+## 6. Coordination note (why this is v2)
 
-- If `.boot-state.json` schema changes, BOTH `updater.rs` and the supervisor scripts must be updated in lockstep. Bump a `schema` field inside the JSON and refuse to parse unknown values.
-- If a new restart-trigger source is added (e.g. a manual `ops restart` CLI), add a row to §4's trigger table + a sentinel convention (don't overload `.restart-requested` — use a new sentinel).
-- The supervisor gate algorithm is the canonical source — don't duplicate the logic per platform; `supervisor.vbs` and `run.sh` should be line-for-line translations.
+v1 of this doc (commit 6e35b45) assumed Bravo's watchdog would escalate
+to a process restart via a `.restart-requested` sentinel + abnormal
+exit. Bravo's design has since evolved (per team-lead 2026-07-18):
+recovery is in-process (control-stream reconnect + relay rehome) and
+does NOT require a process restart. The sentinel is removed; the shared
+surface is just §2 (two boot invariants). This v2 reflects that narrower
+boundary. If Bravo later finds a case where in-process recovery is
+insufficient and a process restart becomes necessary, propose it as a
+new §2.3 entry — don't silently add a sentinel.
+
+## 7. Drift guards
+
+- If `.boot-state.json` schema changes, bump the `schema` field; the supervisor gate refuses unknown values.
+- If a future feature needs a process restart from inside the binary (neither Charlie's clean-exit nor a plain crash), add it as a new §2.x invariant with its own sentinel — don't overload Charlie's files.
