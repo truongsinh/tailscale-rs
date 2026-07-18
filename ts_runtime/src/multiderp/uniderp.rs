@@ -231,11 +231,46 @@ struct Runner {
 impl Runner {
     const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Age floor after which a live derp connection is proactively recycled (closed and
+    /// re-established). Only the home connection lives long enough to hit this — non-home
+    /// connections close on [`INACTIVITY_TIMEOUT`] well before. Bounding the connection lifetime
+    /// sheds a home-derp socket that has silently wedged (TCP still up, no useful traffic) instead
+    /// of leaving the node pinned to it indefinitely.
+    const MAX_CONNECTION_AGE: Duration = Duration::from_secs(300);
+
+    /// Initial delay before retrying a failed derp connection.
+    const RECONNECT_BASE_BACKOFF: Duration = Duration::from_millis(500);
+    /// Cap on the exponential reconnect backoff.
+    const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id))]
     async fn run(&mut self) -> Result<(), ts_derp::Error> {
+        let mut backoff = Self::RECONNECT_BASE_BACKOFF;
+
         loop {
             let pending = self.wait_for_activity().await;
-            let transport = self.connect(pending).await?;
+
+            // Reconnect with exponential backoff instead of letting a transient connect failure
+            // tear down the whole region task (which previously died until a derp map update
+            // respawned it). This keeps a region self-healing across brief derp outages.
+            let transport = match self.connect(pending).await {
+                Ok(transport) => {
+                    backoff = Self::RECONNECT_BASE_BACKOFF;
+                    transport
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        region_id = %self.region_id,
+                        backoff = ?backoff,
+                        error = %e,
+                        "derp connect failed; backing off"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = next_backoff(backoff, Self::RECONNECT_MAX_BACKOFF);
+                    continue;
+                }
+            };
+
             self.run_transport(transport).await?;
         }
     }
@@ -288,6 +323,7 @@ impl Runner {
         &mut self,
         transport: impl UnderlayTransport<PeerKey = PeerId, Error = ts_derp::Error>,
     ) -> Result<(), ts_derp::Error> {
+        let connected_at = Instant::now();
         let mut last_activity = Instant::now();
         let mut from_dataplane = self.from_dataplane.lock().await;
 
@@ -296,6 +332,11 @@ impl Runner {
 
             let inactivity_timeout =
                 (!*self.home_derp_rx.borrow()).then(|| last_activity + Self::INACTIVITY_TIMEOUT);
+
+            // Recycle the connection once it is past the age floor. Returning `Ok` here drops the
+            // transport and sends `run` back around to reconnect, replacing a potentially wedged
+            // long-lived (home) socket with a fresh one.
+            let recycle_deadline = connected_at + Self::MAX_CONNECTION_AGE;
 
             tokio::select! {
                 from_derp = transport.recv() => {
@@ -334,12 +375,28 @@ impl Runner {
                     }
                 },
 
+                _ = tokio::time::sleep_until(recycle_deadline.into()) => {
+                    tracing::debug!(
+                        parent: &span,
+                        region_id = %self.region_id,
+                        "recycling derp connection past age floor"
+                    );
+                    return Ok(());
+                },
+
                 _ = self.home_derp_rx.changed() => {
                     tracing::trace!(is_home_derp = *self.home_derp_rx.borrow());
                 },
             }
         }
     }
+}
+
+/// Compute the next exponential backoff delay, doubling `current` and capping at `max`.
+///
+/// Pure helper (no clock) so the backoff schedule can be unit-tested.
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
 }
 
 struct PeerDbLookup(Arc<RwLock<Option<Arc<PeerDb>>>>);
@@ -369,5 +426,42 @@ async fn option_timeout(duration: Option<Instant>) {
     match duration {
         Some(dur) => tokio::time::sleep_until(dur.into()).await,
         None => core::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{Runner, next_backoff};
+
+    #[test]
+    fn backoff_doubles_then_caps() {
+        let max = Duration::from_secs(30);
+        assert_eq!(
+            next_backoff(Duration::from_millis(500), max),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(1), max),
+            Duration::from_secs(2)
+        );
+        assert_eq!(next_backoff(Duration::from_secs(16), max), max);
+        // Never exceeds the cap, and is idempotent once capped.
+        assert_eq!(next_backoff(max, max), max);
+        assert_eq!(next_backoff(Duration::from_secs(1000), max), max);
+    }
+
+    #[test]
+    fn recycle_age_floor_exceeds_inactivity_timeout() {
+        // The age-floor recycle must be well above the non-home inactivity timeout, so only the
+        // long-lived home connection is ever recycled — non-home connections always close on
+        // inactivity first and never reach the age floor.
+        assert!(Runner::MAX_CONNECTION_AGE > Runner::INACTIVITY_TIMEOUT);
+    }
+
+    #[test]
+    fn reconnect_backoff_bounds_are_sane() {
+        assert!(Runner::RECONNECT_BASE_BACKOFF < Runner::RECONNECT_MAX_BACKOFF);
     }
 }
