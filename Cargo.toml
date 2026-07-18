@@ -274,3 +274,6 @@ required-features = ["ssh"]
 [[test]]
 name = "exec_stdin_integrity"
 required-features = ["ssh"]
+
+[[example]]
+name = "koidra_fetch"
