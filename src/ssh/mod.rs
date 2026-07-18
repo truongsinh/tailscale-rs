@@ -85,10 +85,23 @@ impl crate::Device {
         tracing::info!(%listen_addr, "gateway listener ready");
 
         loop {
-            // An error here is not per-connection: the listener is gone (its handle closed,
-            // or the netstack channel is shut), and every subsequent accept would fail the
-            // same way. Returning surfaces that; looping would spin on it forever.
-            let conn = listener.accept().await?;
+            // An accept error is usually TRANSIENT — resource exhaustion under load (too many
+            // open sockets / FDs) or a momentary netstack blip — NOT a dead listener. Bailing
+            // here (the old `?`) permanently killed the SSH server task while the rest of the
+            // process (tailnet control) kept running, leaving the box control-alive but
+            // SSH-dead: TCP still completes at the netstack layer, but no russh handshake ever
+            // runs, so peers hang at "banner exchange". That is the wedge that bricks remote
+            // access while the control-based off-tailnet watchdog sees nothing wrong.
+            // Fix: log, back off, and keep accepting. A truly-fatal listener (netstack shut
+            // down during process exit) cancels this task, so the loop cannot spin forever.
+            let conn = match listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "ssh listener accept error; backing off");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
             let remote = conn.remote_addr();
 
             let handler = H::new_client(self.clone(), remote);
