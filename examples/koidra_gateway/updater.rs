@@ -11,11 +11,11 @@
 //! IDLE (sleep 600 s ± 120 s jitter)
 //!   → FETCH   GET manifest.json (rustls, TLS 1.3 on Win7)
 //!   → COMPARE manifest.version vs current — equal/older → IDLE
-//!   → LOCK    .koidra-ssh-update.lock (per-box, both channels honor)
+//!   → LOCK    .koidra-gateway-update.lock (per-box, both channels honor)
 //!   → DOWNLOAD target.url → temp file
 //!   → VERIFY  sha256(temp) == target.sha256
-//!   → STAGE   rename → ssh_shell-{version}{exe_suffix}
-//!   → COMMIT  write current-ssh-shell.txt (temp+rename) + push rollback stack
+//!   → STAGE   rename → koidra-gateway-{version}{exe_suffix}
+//!   → COMMIT  write current-koidra-gateway.txt (temp+rename) + push rollback stack
 //!   → EXIT    process::exit(0); supervisor relaunches within 5 s
 //! ```
 //!
@@ -23,14 +23,14 @@
 //!
 //! The supervisor (not this code) runs a health-gate loop on the next launch: if the
 //! new binary fails its listen-socket gate within 60 s, the supervisor pops the
-//! rollback stack and reverts `current-ssh-shell.txt`. See
+//! rollback stack and reverts `current-koidra-gateway.txt`. See
 //! `.doc/2026-07-supervisor-restart-interface.md` §3.
 //!
 //! ## Boot contract (shared with Bravo P1)
 //!
 //! The binary's `main` (not this module) writes `.boot-state.json` at boot so the
 //! supervisor's gate can detect a failed launch. This module reads/writes only
-//! `current-ssh-shell.txt`, `.rollback-stack.txt`, and `.koidra-ssh-update.lock`.
+//! `current-koidra-gateway.txt`, `.rollback-stack.txt`, and `.koidra-gateway-update.lock`.
 
 use std::{
     path::{Path, PathBuf},
@@ -52,7 +52,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(600);
 const POLL_JITTER: Duration = Duration::from_secs(120);
 
 /// Per-box advisory lockfile (both channels honor this). Payload: PID + timestamp.
-const LOCKFILE_NAME: &str = ".koidra-ssh-update.lock";
+const LOCKFILE_NAME: &str = ".koidra-gateway-update.lock";
 
 /// Stale lock threshold: if the lock is older than this, steal it. Bounds how long a
 /// crashed updater on the other channel can block its peer.
@@ -62,7 +62,7 @@ const LOCK_STALE_AFTER: Duration = Duration::from_secs(120);
 const ROLLBACK_STACK_MAX: usize = 3;
 
 /// State files in the install dir (Charlie-owned; Bravo never touches these).
-const CURRENT_EXE_NAME: &str = "current-ssh-shell.txt";
+const CURRENT_EXE_NAME: &str = "current-koidra-gateway.txt";
 const ROLLBACK_STACK_NAME: &str = ".rollback-stack.txt";
 
 /// Schema version this updater understands.
@@ -137,7 +137,7 @@ pub fn spawn(install_dir: PathBuf, current_version: &'static str, manifest_url: 
                 Ok(CycleOutcome::Updated) => {
                     // EXIT — supervisor relaunches within ~5 s (Windows supervisor.vbs)
                     // or immediately (Linux systemd Restart=on-failure). The new
-                    // current-ssh-shell.txt points at the new binary.
+                    // current-koidra-gateway.txt points at the new binary.
                     info!("update committed; exiting for supervisor relaunch");
                     std::process::exit(0);
                 }
@@ -153,7 +153,7 @@ pub fn spawn(install_dir: PathBuf, current_version: &'static str, manifest_url: 
 }
 
 /// Outcome of a single updater cycle. `Updated` means a new binary was staged +
-/// `current-ssh-shell.txt` was swapped + the caller should `process::exit(0)` so the
+/// `current-koidra-gateway.txt` was swapped + the caller should `process::exit(0)` so the
 /// supervisor relaunches the new file. `NoUpdate` means the manifest matched the
 /// running version (or was older) and the cycle is a no-op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,10 +257,10 @@ pub(crate) async fn run_one_cycle(
     info!(sha256 = %actual_sha, size = bytes.len(), "sha256 verified");
 
     // STAGE: write the new binary to its final filename (not the running exe's name,
-    // which is locked on Windows). The supervisor picks it up via current-ssh-shell.txt.
+    // which is locked on Windows). The supervisor picks it up via current-koidra-gateway.txt.
     let exe_suffix = std::env::consts::EXE_SUFFIX;
     let stage_name = format!(
-        "ssh_shell-{}{}",
+        "koidra-gateway-{}{}",
         sanitize_for_filename(&manifest.version),
         exe_suffix
     );
@@ -407,12 +407,12 @@ impl Drop for LockGuard {
     }
 }
 
-/// Atomically swap `current-ssh-shell.txt` to `new_exe_name` and push the previous
+/// Atomically swap `current-koidra-gateway.txt` to `new_exe_name` and push the previous
 /// value onto the rollback stack.
 ///
 /// Order matters: we push the rollback stack FIRST (atomic), then write
-/// current-ssh-shell.txt (atomic). If we crash between the two, the supervisor sees
-/// the OLD current-ssh-shell.txt and just launches the old binary — a harmless no-op.
+/// current-koidra-gateway.txt (atomic). If we crash between the two, the supervisor sees
+/// the OLD current-koidra-gateway.txt and just launches the old binary — a harmless no-op.
 /// The orphan rollback entry is harmless (it's just a previous-filename record).
 async fn commit_swap(install_dir: &Path, new_exe_name: &str) -> Result<(), UpdaterError> {
     let current_path = install_dir.join(CURRENT_EXE_NAME);
@@ -439,9 +439,9 @@ async fn commit_swap(install_dir: &Path, new_exe_name: &str) -> Result<(), Updat
         info!(prev = prev_name, "pushed rollback stack entry");
     }
 
-    // Write new current-ssh-shell.txt.
+    // Write new current-koidra-gateway.txt.
     atomic_write(&current_path, new_exe_name.as_bytes()).await?;
-    info!(new = new_exe_name, "current-ssh-shell.txt updated");
+    info!(new = new_exe_name, "current-koidra-gateway.txt updated");
 
     Ok(())
 }
@@ -556,14 +556,14 @@ mod tests {
     #[tokio::test]
     async fn atomic_write_replaces_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("current-ssh-shell.txt");
+        let path = dir.path().join("current-koidra-gateway.txt");
         atomic_write(&path, b"ssh_shell-new.exe").await.unwrap();
         assert_eq!(fs::read_to_string(&path).await.unwrap(), "ssh_shell-new.exe");
         // Second write replaces.
         atomic_write(&path, b"ssh_shell-newer.exe").await.unwrap();
         assert_eq!(fs::read_to_string(&path).await.unwrap(), "ssh_shell-newer.exe");
         // Temp file cleaned up by rename.
-        assert!(!dir.path().join("current-ssh-shell.txt.tmp").exists());
+        assert!(!dir.path().join("current-koidra-gateway.txt.tmp").exists());
     }
 
     #[tokio::test]
@@ -571,7 +571,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let install = dir.path();
 
-        // Seed an initial current-ssh-shell.txt.
+        // Seed an initial current-koidra-gateway.txt.
         atomic_write(&install.join(CURRENT_EXE_NAME), b"ssh_shell-old.exe")
             .await
             .unwrap();
@@ -699,7 +699,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let install = dir.path();
 
-        // Seed: an "old" binary name in current-ssh-shell.txt.
+        // Seed: an "old" binary name in current-koidra-gateway.txt.
         atomic_write(&install.join(CURRENT_EXE_NAME), b"ssh_shell-old")
             .await
             .unwrap();
@@ -742,14 +742,14 @@ mod tests {
 
         assert_eq!(outcome, CycleOutcome::Updated);
 
-        // current-ssh-shell.txt now points at the staged binary.
+        // current-koidra-gateway.txt now points at the staged binary.
         let current_name = fs::read_to_string(&install.join(CURRENT_EXE_NAME))
             .await
             .unwrap();
         let current_name = current_name.trim();
         assert!(
             current_name.contains("0.4.0-NEW_FAKE"),
-            "current-ssh-shell.txt should contain the new version, got: {}",
+            "current-koidra-gateway.txt should contain the new version, got: {}",
             current_name
         );
 
@@ -785,7 +785,7 @@ mod tests {
             .expect("cycle should succeed");
 
         assert_eq!(outcome, CycleOutcome::NoUpdate);
-        // current-ssh-shell.txt should NOT exist (we never wrote it).
+        // current-koidra-gateway.txt should NOT exist (we never wrote it).
         assert!(!install.join(CURRENT_EXE_NAME).exists());
     }
 }

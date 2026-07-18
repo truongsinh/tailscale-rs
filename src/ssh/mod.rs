@@ -82,7 +82,7 @@ impl crate::Device {
         let config = Arc::new(config);
         let listener = self.tcp_listen(listen_addr).await?;
 
-        tracing::info!(%listen_addr, "ssh server listening");
+        tracing::info!(%listen_addr, "gateway listener ready");
 
         loop {
             // An error here is not per-connection: the listener is gone (its handle closed,
@@ -113,7 +113,7 @@ impl crate::Device {
                 };
 
                 if let Err(e) = sess.await {
-                    tracing::debug!(%remote, error = ?e, "running ssh session");
+                    tracing::debug!(%remote, error = ?e, "running gateway session");
                 }
             });
         }

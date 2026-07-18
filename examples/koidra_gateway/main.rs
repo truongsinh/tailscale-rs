@@ -313,7 +313,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
         )
         .init();
 
-    tracing::info!(version = tailscale::IPN_VERSION, "starting ssh_shell");
+    tracing::info!(version = tailscale::IPN_VERSION, "starting koidra-gateway");
 
     tracing::warn!(
         "authorization is delegated to the tailnet ACL / packet filter; this server accepts \
