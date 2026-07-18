@@ -1,13 +1,12 @@
 # example: ssh shell
 
-Run an SSH server on the tailnet that serves real `exec` and `shell` sessions, authenticating
-clients against an OpenSSH `authorized_keys` file.
+Run an SSH server on the tailnet that serves real `exec` and `shell` sessions.
 
-Unlike [ssh_peer_lookup](../ssh_peer_lookup), which serves a TUI and accepts anyone the packet
-filter lets through, this example checks public keys: `none` and `password` authentication are
-refused, and only `publickey` is advertised. Tailnet policy rules still apply underneath — a peer
-that policy forbids from reaching the listen port never gets as far as authenticating. The `ssh`
-policy file block is still not consulted.
+Like [ssh_peer_lookup](../ssh_peer_lookup), this example accepts anyone the tailnet packet filter
+lets through: there is no application-level authentication. `none` is the only method advertised;
+`publickey` and `password` are refused. A peer that policy forbids from reaching the listen port
+never gets as far as authenticating. The `ssh` policy file block is still not consulted — tighten
+who may reach this port in the tailnet ACL / packet filter, not here.
 
 The server key is randomized on each start, so you will likely want to connect using
 `-o StrictHostKeyChecking=no`.
@@ -31,9 +30,9 @@ pipes on every platform beats serving a pty everywhere except the platform we ca
 
 ```shell
 $ cargo run --example ssh_shell --features ssh -- \
-      -k $MY_AUTH_KEY -c $MY_CONFIG_FILE -A ~/.ssh/authorized_keys
+      -k $MY_AUTH_KEY -c $MY_CONFIG_FILE
 ...
-INFO ssh_shell: loaded authorized keys keys=1 path=/home/you/.ssh/authorized_keys
+WARN ssh_shell: authorization is delegated to the tailnet ACL / packet filter; this server accepts any peer that reaches the listen port
 INFO tailscale::ssh: ssh server listening listen_addr=$TAILNET_IP:22
 ...
 

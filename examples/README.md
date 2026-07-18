@@ -40,5 +40,5 @@ tailnet.
 
 ### [SSH Shell](ssh_shell)
 
-An in-process SSH server serving `exec` and `shell` sessions, authenticated against an
-`authorized_keys` file.
+An in-process SSH server serving `exec` and `shell` sessions. Authorization is delegated
+entirely to the tailnet ACL / packet filter; there is no application-level authentication.

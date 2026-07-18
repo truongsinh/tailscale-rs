@@ -265,5 +265,3 @@ required-features = ["ssh"]
 [[example]]
 name = "ssh_shell"
 required-features = ["ssh"]
-# Unlike the other examples, this one carries unit tests (authorized_keys parsing).
-test = true

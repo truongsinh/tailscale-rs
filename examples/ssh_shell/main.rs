@@ -1,5 +1,8 @@
-//! Run an SSH server on the tailnet that serves real `exec` and `shell` sessions,
-//! authenticating clients against an `authorized_keys` file.
+//! Run an SSH server on the tailnet that serves real `exec` and `shell` sessions.
+//!
+//! There is no application-level authentication: authorization is delegated entirely to
+//! the tailnet ACL / packet filter. A peer that reaches the listen port has already been
+//! admitted, and the server accepts it and logs who connected.
 //!
 //! Sessions are pipe-backed: no pty is allocated, and `pty-req` is refused. See the
 //! module docs on [`ShellServer`] for why.
@@ -9,7 +12,7 @@ use std::{collections::HashMap, net::IpAddr, path::PathBuf, process::Stdio, sync
 use clap::Parser;
 use russh::{
     Channel, ChannelId,
-    keys::{Algorithm, PublicKey},
+    keys::Algorithm,
     server::{Auth, Handle, Handler, Msg, Session},
 };
 use tailscale::ssh::TailnetServer;
@@ -20,51 +23,36 @@ use tokio::{
 };
 use tracing_subscriber::filter::LevelFilter;
 
-mod authorized_keys;
-
-use authorized_keys::AuthorizedKeys;
-
 /// Run an SSH server on the tailnet serving exec and shell sessions.
 ///
-/// Clients must authenticate with a public key listed in the --authorized-keys file;
-/// password and none authentication are refused. Note that tailnet policy rules still
-/// apply on top of this: a peer that policy forbids from reaching the listen port never
-/// gets as far as authenticating.
+/// There is no application-level authentication. A peer that reaches the listen port has
+/// already been admitted by the tailnet packet filter, which enforces the tailnet ACL; the
+/// server accepts it and logs who connected. Tighten who may reach this port in the
+/// tailnet policy, not here.
 #[derive(clap::Parser)]
 #[command(version, about)]
 struct Args {
-    /// Path to a key file to use. Will be created if it doesn't exist.
+    /// Path to a key file to use. Will be created if it doesn't exist
     #[arg(short = 'c', long, default_value = "tsrs_keys.json")]
     key_file: PathBuf,
 
-    /// The auth key to connect with.
-    ///
-    /// Can be omitted if the key file is already authenticated.
+    /// The auth key to connect with. Can be omitted if the key file is already authenticated.
     #[arg(short = 'k', long)]
     auth_key: Option<String>,
 
-    /// Port to listen on (on tailnet IPv4).
+    /// Port to listen on (on tailnet IPv4)
     #[clap(short, long, default_value_t = 22)]
     listen_port: u16,
-
-    /// Path to an OpenSSH authorized_keys file listing the keys permitted to connect.
-    #[clap(short = 'A', long)]
-    authorized_keys: PathBuf,
 }
-
-/// The keys permitted to connect, and the process each session runs.
-///
-/// This is process-global state rather than a field threaded into the handler because
-/// [`TailnetServer::new_client`] fixes the handler's constructor signature at
-/// `(device, addr)`, leaving no seam to inject per-server configuration. See the README.
-static AUTHORIZED_KEYS: std::sync::OnceLock<AuthorizedKeys> = std::sync::OnceLock::new();
 
 /// An SSH server serving one connection.
 ///
 /// # Authentication
 ///
-/// Public key only, against [`AUTHORIZED_KEYS`]. `none` and `password` are refused by
-/// leaving russh's rejecting defaults in place and advertising only `publickey`.
+/// None: authorization is delegated entirely to the tailnet ACL / packet filter. A peer
+/// that reaches the listen port has already been admitted; `auth_none` resolves it only to
+/// log who connected, then accepts unconditionally. `publickey` and `password` are refused
+/// by leaving russh's rejecting defaults in place and advertising only `none`.
 ///
 /// # No pty
 ///
@@ -249,8 +237,8 @@ async fn forward(
 impl Handler for ShellServer {
     type Error = russh::Error;
 
-    #[tracing::instrument(skip_all, fields(user = %user, remote = %self.remote))]
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+    #[tracing::instrument(skip_all, fields(remote = %self.remote))]
+    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
         let peer = self
             .dev
             .peer_by_tailnet_ip(self.remote.ip())
@@ -258,24 +246,9 @@ impl Handler for ShellServer {
             .ok()
             .flatten();
 
-        let Some(keys) = AUTHORIZED_KEYS.get() else {
-            tracing::error!("authorized keys unset");
-            return Ok(Auth::reject());
-        };
-
-        if !keys.contains(key) {
-            tracing::warn!(
-                fingerprint = %key.fingerprint(Default::default()),
-                peer = peer.as_ref().map(|p| p.fqdn(false)),
-                "rejecting unauthorized key"
-            );
-            return Ok(Auth::reject());
-        }
-
         tracing::info!(
-            fingerprint = %key.fingerprint(Default::default()),
             peer = peer.as_ref().map(|p| p.fqdn(false)),
-            "authenticated"
+            "accepting session (tailnet-authorized)"
         );
 
         Ok(Auth::Accept)
@@ -390,24 +363,12 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
 
     tracing::info!(version = tailscale::IPN_VERSION, "starting ssh_shell");
 
+    tracing::warn!(
+        "authorization is delegated to the tailnet ACL / packet filter; this server accepts \
+         any peer that reaches the listen port"
+    );
+
     let args = Args::parse();
-
-    let path = args.authorized_keys.display().to_string();
-    let contents = tokio::fs::read_to_string(&args.authorized_keys).await?;
-    let keys = AuthorizedKeys::parse(&path, &contents)?;
-
-    if keys.len() == 0 {
-        // Every connection would be rejected, which looks like a network fault from the
-        // client side. Fail loudly at startup instead.
-        return Err(format!("{path}: no keys, so no client could ever authenticate").into());
-    }
-
-    tracing::info!(keys = keys.len(), path, "loaded authorized keys");
-
-    // Nothing else ever sets this, so the only way to fail here is a bug in this function.
-    AUTHORIZED_KEYS
-        .set(keys)
-        .expect("authorized keys are set exactly once, at startup");
 
     let dev = tailscale::Device::new(
         &tailscale::Config::default_with_key_file(&args.key_file).await?,
@@ -424,7 +385,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
                 &mut rand::rng(),
                 Algorithm::Ed25519,
             )?],
-            methods: russh::MethodSet::from(&[russh::MethodKind::PublicKey][..]),
+            methods: russh::MethodSet::from(&[russh::MethodKind::None][..]),
             nodelay: true,
             ..Default::default()
         },
