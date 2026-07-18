@@ -5170,6 +5170,7 @@ dependencies = [
  "clap",
  "include_dir",
  "itertools",
+ "libc",
  "mime_guess",
  "rand 0.10.2",
  "ratatui",
