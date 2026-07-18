@@ -230,6 +230,7 @@ clap = { workspace = true, features = ["derive", "env", "string"] }
 chrono.workspace = true
 include_dir = "0.7"
 itertools.workspace = true
+libc = "0.2"
 mime_guess = "2.0"
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true, features = ["release_max_level_info"] }
@@ -268,4 +269,12 @@ required-features = ["ssh"]
 
 [[test]]
 name = "exec_stdin_integrity"
+required-features = ["ssh"]
+
+[[test]]
+name = "stress_ssh_churn"
+required-features = ["ssh"]
+
+[[test]]
+name = "stress_ssh_heavy_transfer"
 required-features = ["ssh"]
