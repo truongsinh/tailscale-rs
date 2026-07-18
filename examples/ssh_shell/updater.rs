@@ -112,14 +112,24 @@ pub struct Manifest {
 /// function does NOT return a handle whose join implies "updater is done." The handle
 /// is dropped on the floor intentionally: the supervisor's relaunch is the cycle's
 /// completion signal.
+///
+/// Poll interval is `POLL_INTERVAL` (600 s default), overridable via
+/// `KOIDRA_UPDATER_POLL_SECS` env var (useful for dev/test canaries and for fleet
+/// segments that need faster or slower roll cadence).
 pub fn spawn(install_dir: PathBuf, current_version: &'static str, manifest_url: String) {
+    let poll_interval = std::env::var("KOIDRA_UPDATER_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(POLL_INTERVAL);
+
     tokio::spawn(async move {
-        info!(%manifest_url, %current_version, install_dir = %install_dir.display(), "fleet updater task started");
+        info!(%manifest_url, %current_version, poll_secs = poll_interval.as_secs(), install_dir = %install_dir.display(), "fleet updater task started");
         loop {
             // Sleep with jitter BEFORE the first fetch. A freshly-booted binary is already
             // at its current version; no need to check immediately. Also staggers the two
             // channels (which share the same install_dir + lockfile).
-            let sleep = jittered_sleep();
+            let sleep = jittered_sleep(poll_interval);
             time::sleep(sleep).await;
 
             if let Err(e) = run_one_cycle(&install_dir, current_version, &manifest_url).await {
@@ -253,11 +263,13 @@ async fn run_one_cycle(
     std::process::exit(0);
 }
 
-/// Sleep duration: uniform in `[POLL_INTERVAL - POLL_JITTER, POLL_INTERVAL + POLL_JITTER)`.
+/// Sleep duration: uniform in `[center - jitter_half, center + jitter_half)`.
+/// Jitter is capped at half the interval so a short test interval (e.g. 5 s via
+/// `KOIDRA_UPDATER_POLL_SECS`) doesn't produce a negative or wildly disproportionate sleep.
 /// Uses a cheap LCG seeded from the system clock so we don't pull in a heavyweight RNG.
-fn jittered_sleep() -> Duration {
-    let center = POLL_INTERVAL.as_secs();
-    let half = POLL_JITTER.as_secs();
+fn jittered_sleep(center: Duration) -> Duration {
+    let center_secs = center.as_secs();
+    let half = POLL_JITTER.as_secs().min(center_secs / 2);
     // Cheap deterministic jitter: nanos of SystemTime XOR'd with the PID. Good enough
     // for staggering two processes that boot within seconds of each other.
     let seed = std::time::SystemTime::now()
@@ -271,7 +283,7 @@ fn jittered_sleep() -> Duration {
         // LCG step to spread the seed across the window.
         (seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 33) % (2 * half)
     };
-    Duration::from_secs(center.saturating_sub(half).saturating_add(jitter))
+    Duration::from_secs(center_secs.saturating_sub(half).saturating_add(jitter))
 }
 
 /// Returns the current target triple, preferring `KOIDRA_TARGET` env var (set by the
