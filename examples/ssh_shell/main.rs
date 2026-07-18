@@ -7,7 +7,7 @@
 //! Sessions are pipe-backed: no pty is allocated, and `pty-req` is refused. See the
 //! module docs on [`ShellServer`] for why.
 
-use std::{net::IpAddr, path::PathBuf, process::Stdio, sync::Arc};
+use std::{net::IpAddr, path::{Path, PathBuf}, process::Stdio, sync::Arc};
 
 use clap::Parser;
 use russh::{
@@ -17,10 +17,15 @@ use russh::{
 };
 use tailscale::ssh::TailnetServer;
 use tokio::{
+    fs,
     io::AsyncWriteExt,
     process::Command,
 };
 use tracing_subscriber::filter::LevelFilter;
+
+// Fleet self-update pipeline: manifest poll, atomic binary swap, rollback stack.
+// Spawned from main() when --manifest-url is provided. See `.doc/2026-07-fleet-self-update.md`.
+mod updater;
 
 /// Run an SSH server on the tailnet serving exec and shell sessions.
 ///
@@ -42,6 +47,19 @@ struct Args {
     /// Port to listen on (on tailnet IPv4)
     #[clap(short, long, default_value_t = 22)]
     listen_port: u16,
+
+    /// URL of the fleet update manifest. If set, a background updater task is spawned
+    /// that periodically checks for a newer binary and, when one is available, stages
+    /// it and exits cleanly so the supervisor relaunches the new file. See
+    /// `.doc/2026-07-fleet-self-update.md`.
+    #[arg(long = "manifest-url", env = "KOIDRA_MANIFEST_URL")]
+    manifest_url: Option<url::Url>,
+
+    /// Install directory holding binaries + state files. Defaults to the parent of the
+    /// running exe, which is correct for the standard fleet layouts. Override only for
+    /// dev/test.
+    #[arg(long = "install-dir", env = "KOIDRA_INSTALL_DIR")]
+    install_dir: Option<PathBuf>,
 }
 
 /// An SSH server serving one connection.
@@ -313,6 +331,26 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     let ipv4: IpAddr = dev.ipv4_addr().await?.into();
     let dev = Arc::new(dev);
 
+    // Install dir = parent of the running exe by default. Override via --install-dir.
+    let install_dir = args.install_dir.clone().unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+
+    // Boot contract — `.doc/2026-07-supervisor-restart-interface.md` §2.1.
+    // Write .boot-state.json BEFORE serve_ssh so the supervisor's health-gate can
+    // detect a failed launch (the gate probes TCP, but boot-state records the attempt).
+    write_boot_state(&install_dir, tailscale::IPN_VERSION, ipv4).await;
+
+    // Spawn the updater task if a manifest URL was provided. The task runs for the
+    // process lifetime; on a successful update it calls process::exit(0) so the
+    // supervisor relaunches the new binary. See `updater` module docs.
+    if let Some(url) = args.manifest_url.clone() {
+        updater::spawn(install_dir.clone(), tailscale::IPN_VERSION, url.to_string());
+    }
+
     dev.serve_ssh::<ShellServer>(
         russh::server::Config {
             keys: vec![russh::keys::PrivateKey::random(
@@ -328,4 +366,34 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     .await?;
 
     Ok(())
+}
+
+/// Write `.boot-state.json` atomically in the install dir.
+///
+/// Records `{schema, booted_at, version, target_ip}` so the supervisor's health-gate
+/// can detect a failed launch (binary booted, wrote boot-state, then died within the
+/// gate window — the supervisor pops the rollback stack and reverts).
+///
+/// Failure to write is non-fatal: the supervisor's gate just can't distinguish a
+/// fresh-launch failure from a mid-run crash, which only affects automatic rollback
+/// (plain crash-recovery still works via the supervisor's default restart behavior).
+async fn write_boot_state(install_dir: &Path, version: &str, target_ip: IpAddr) {
+    let boot_state = serde_json::json!({
+        "schema": 1,
+        "booted_at": chrono::Utc::now().to_rfc3339(),
+        "version": version,
+        "target_ip": target_ip.to_string(),
+    });
+    let path = install_dir.join(".boot-state.json");
+    let tmp = install_dir.join(".boot-state.json.tmp");
+    if let Err(e) = fs::write(&tmp, boot_state.to_string()).await {
+        tracing::warn!(error = %e, path = %path.display(), "failed to write boot-state tmp");
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp, &path).await {
+        tracing::warn!(error = %e, path = %path.display(), "failed to rename boot-state into place");
+        // Best-effort cleanup of the orphan temp file.
+        let _ = fs::remove_file(&tmp).await;
+    }
+    tracing::debug!(path = %path.display(), %version, "boot-state written");
 }

@@ -135,6 +135,8 @@ One `tokio::spawn` per process; states:
 
 ## 4. Shared primitive — health-gate (BRAVO owns the implementation; Charlie consumes)
 
+> **Canonical interface**: see [2026-07-supervisor-restart-interface.md](2026-07-supervisor-restart-interface.md) for the tight Bravo-facing contract — the two restart mechanisms (Bravo in-process vs Charlie supervisor-level), the Bravo watchdog → supervisor fallback path, and the shared gate algorithm with per-trigger behavior. The summary below is the original design view; the interface doc refines it.
+
 This is the contract Bravo's P1 watchdog and Charlie's updater both depend on. Bravo builds it; Charlie calls it from the new binary on boot.
 
 ### State files (in install dir)
@@ -278,9 +280,37 @@ A canary FAIL = stop, diagnose, fix, restart canary from stage 1.
 | Bad manifest | Push a corrected manifest. Updater is idempotent (same version = no-op). |
 | Tag compromised | Revoke + force-push tag with signed manifest (after minisign lands). Today, GitHub 2FA on the tag owner is the only gate. |
 
-## 11. First-deploy bridge (Option B)
+## 11. First-deploy bridge (Option B) + Win7/PS2.0 bootstrap reality
 
 The first time we deploy the updater itself, we use the existing validated `koidra-upgrade.ps1` (already in `upgrade-kit-d897332/`). It's a one-shot kit-delivered swap; once landed, all subsequent rolls are pull-based. We do NOT agent-automate the kit delivery to Win7 boxes — that's the TeamViewer path the kit was designed for.
+
+### Bootstrap caveat (confirmed 2026-07-18 on redsun-win7 canary)
+
+The self-updater has a **first-install problem** — getting the first self-updater-equipped binary onto a Win7/PS2.0 box STILL needs a non-rustls transfer, because the binary that would do the rustls pull isn't on-box yet. Confirmed on redsun-win7 (ECONT4635):
+
+- **PowerShell 2.0 only** (no PS 3+ installed); .NET CLR 2.0 default (PS 2.0 runs on .NET 2.0, NOT 4.x).
+- **TLS 1.2 GitHub download FAILS from PS** — `[Net.ServicePointManager]::SecurityProtocol = 12` errors (enum has no `Tls12` member under .NET 2.0 CLR). Even with .NET 4.5 installed (release 378389), PS 2.0 can't load it.
+- **HTTP-over-tailnet workarounds also fail** — `ssh_shell`'s userspace networking doesn't forward arbitrary inbound ports; the in-binary HTTPS client is the ONLY path that works on Win7.
+- **`ssh_shell` exec-channel STDIN corruption** (Bravo P2, confirmed reproducibly) means bulk transfer over the existing SSH channel truncates bytes — can't use it for binary delivery today.
+
+### Bootstrap options for the first self-updater binary
+
+| Option | When | Cost |
+|---|---|---|
+| **TeamViewer at next on-site** (user action) | Now | One customer-impact visit per box; deliver the upgrade kit (contains the new binary + `koidra-upgrade.ps1`). After this, the kit's binary is self-updating. **USER ACTION** — flag for human, don't auto-schedule. |
+| **Chunked base64 over SSH exec** (after Bravo P2 lands) | Post-P2 | ~2-4 KB cmdline ceiling per chunk → ~4-5k chunks for a 9.6 MB binary; slow but reliable once P2 fixes the stdin-corruption bug. Operator-driven, no user action. |
+| **Local copy from pre-staged file** | If user drops the kit zip in Downloads during a visit | Fastest when the binary's already on-box (e.g. user dropped it during a visit). |
+
+After ANY of these lands the first self-updater binary, all subsequent rolls are pull-based via in-binary rustls (TLS 1.3 on Win7, no .NET involvement). **The first-install problem is a one-time cost per box, not a recurring one.**
+
+### What this means for priority
+
+Bravo's P1 watchdog deployment to redsun-win7 STILL needs TeamViewer for the first delivery — the self-updater doesn't accelerate that. What the self-updater DOES solve:
+- All Charlie P4 fleet rolls after the first delivery (zero TeamViewer per roll).
+- All future Bravo watchdog version upgrades on boxes already running a self-updater binary.
+- Diagnostics / kit refreshes on any self-updater-equipped box.
+
+This is why P4 is elevated in priority but not on the critical path for the immediate redsun canary — it's the multiplier for every subsequent operation.
 
 ## 12. Out of scope (for the autonomous week)
 
