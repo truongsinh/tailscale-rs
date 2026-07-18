@@ -388,6 +388,8 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
         )
         .init();
 
+    tracing::info!(version = tailscale::IPN_VERSION, "starting ssh_shell");
+
     let args = Args::parse();
 
     let path = args.authorized_keys.display().to_string();

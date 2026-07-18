@@ -28,13 +28,18 @@ pub struct Config {
 impl Config {
     /// Get the full client name as a string.
     ///
-    /// This takes the form `tailscale-rs ({client_name})`, where the parenthetical is only
-    /// provided if self.client_name is set.
+    /// This takes the form `tailscale-rs ({client_name}) run={identity}`, where the
+    /// parenthetical is only provided if `self.client_name` is set. The trailing `run=`
+    /// token mirrors the identity folded into `HostInfo.ipn_version`; the admin console
+    /// exposes `clientVersion` but not `app`, so carrying it in both is harmless redundancy
+    /// that keeps the identity visible wherever the operator happens to look.
     pub fn format_client_name(&self) -> String {
         let mut full_name = "tailscale-rs".to_owned();
         if let Some(client_name) = &self.client_name {
             full_name.push_str(&format!(" ({client_name})"));
         }
+        full_name.push(' ');
+        full_name.push_str(crate::run_identity::run_identity());
 
         full_name
     }

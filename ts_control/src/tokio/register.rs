@@ -114,15 +114,15 @@ pub async fn register(
     let node_public_key = node_keystate.node_keys.public;
     let network_lock_public_key = node_keystate.network_lock_keys.public;
 
+    // Bind the client name to a local so its `run=` identity outlives the borrow in `hostinfo`.
+    let client_name = config.format_client_name();
+    let mut hostinfo = HostInfo::default();
+    crate::map_request_builder::apply_host_info(&mut hostinfo, config, &client_name);
+
     let register_req = RegisterRequest {
         version: CapabilityVersion::CURRENT,
         node_key: node_public_key,
-        hostinfo: HostInfo {
-            hostname: config.hostname.as_deref(),
-            app: &config.format_client_name(),
-            ipn_version: crate::PKG_VERSION,
-            ..Default::default()
-        },
+        hostinfo,
         nl_key: Some(network_lock_public_key),
         auth: auth_key.map(RegisterAuth::from),
         ephemeral: true,

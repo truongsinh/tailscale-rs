@@ -2,14 +2,13 @@
 
 extern crate alloc;
 
-/// Package version of `ts_control` as reported by cargo.
-// TODO(npry): this is used to populate Hostinfo.ipn_version, which requests "long format":
-//  attach build info and whatever else that entails
-const PKG_VERSION: &str = if let Some(version) = option_env!("CARGO_PKG_VERSION") {
-    version
-} else {
-    ""
-};
+/// The version this client reports to control in `HostInfo.ipn_version`, in the "long format"
+/// control expects: the cargo package version joined with the build SHA, e.g. `0.4.0-abc1234`.
+///
+/// `TS_RS_BUILD_SHA` is baked in by `build.rs` (falling back to `unknown` when unset). The
+/// goarch and run-identity are folded on top of this at request-build time; see
+/// [`map_request_builder`].
+pub const IPN_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-", env!("TS_RS_BUILD_SHA"));
 
 mod config;
 mod control_dialer;
@@ -18,6 +17,7 @@ mod dial_plan;
 #[cfg_attr(not(feature = "async_tokio"), expect(dead_code))]
 mod map_request_builder;
 mod node;
+mod run_identity;
 #[cfg(feature = "async_tokio")]
 mod tokio;
 

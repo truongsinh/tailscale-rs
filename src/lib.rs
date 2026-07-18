@@ -135,6 +135,8 @@ pub use config::Config;
 #[doc(inline)]
 pub use error::{Error, InternalErrorKind};
 #[doc(inline)]
+pub use ts_control::IPN_VERSION;
+#[doc(inline)]
 pub use ts_control::Node as NodeInfo;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
 use ts_runtime::Spawn;

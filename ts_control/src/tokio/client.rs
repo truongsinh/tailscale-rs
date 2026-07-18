@@ -70,23 +70,6 @@ impl AsyncControlClient {
 
         tracing::info!("registered, starting netmap stream");
 
-        let builder = MapRequestBuilder::new(node_keys)
-            .keep_alive(true)
-            .omit_peers(false)
-            .stream(true);
-
-        let mut request = if let Some(hostname) = &config.hostname {
-            builder.hostname(hostname)
-        } else {
-            builder
-        }
-        .build();
-
-        let client_name = config.format_client_name();
-        let host_info = request.host_info.get_or_insert_default();
-        host_info.app = &client_name;
-        host_info.ipn_version = crate::PKG_VERSION;
-
         let (state_tx, state_rx) = broadcast::channel(32);
         let (command_tx, command_rx) = mpsc::channel(32);
 
@@ -215,17 +198,14 @@ async fn run_once(
 
     crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await?;
 
-    let builder = MapRequestBuilder::new(node_keys)
+    // Bind the client name to a local so its `run=` identity outlives the request borrow.
+    let client_name = config.format_client_name();
+    let request = MapRequestBuilder::new(node_keys)
         .keep_alive(true)
         .omit_peers(false)
-        .stream(true);
-
-    let request = if let Some(hostname) = &config.hostname {
-        builder.hostname(hostname)
-    } else {
-        builder
-    }
-    .build();
+        .stream(true)
+        .host_info(config, &client_name)
+        .build();
 
     let map_url = control_url.join("machine/map").unwrap();
 
@@ -257,17 +237,16 @@ async fn run_once(
             command = command_rx.recv() => {
                 match command.unwrap() {
                     Command::SetDerpHomeRegion { id, latencies } => {
-                        let mut builder = MapRequestBuilder::new(node_keys)
+                        // Bind the client name to a local so its `run=` identity outlives the request.
+                        let client_name = config.format_client_name();
+                        let req = MapRequestBuilder::new(node_keys)
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
                             .preferred_derp(id)
-                            .derp_latencies(latencies.iter().map(|(k, v)| (k.as_str(), *v)));
-
-                        if let Some(hostname) = &config.hostname {
-                            builder = builder.hostname(hostname);
-                        }
-                        let req = builder.build();
+                            .derp_latencies(latencies.iter().map(|(k, v)| (k.as_str(), *v)))
+                            .host_info(config, &client_name)
+                            .build();
 
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },

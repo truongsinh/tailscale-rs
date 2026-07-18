@@ -5866,6 +5866,7 @@ dependencies = [
  "gethostname",
  "ipnet",
  "lazy_static",
+ "nix 0.31.3",
  "pin-project-lite",
  "serde",
  "serde_json",
@@ -5887,6 +5888,7 @@ dependencies = [
  "ts_packetfilter_state",
  "ts_tls_util",
  "url",
+ "windows 0.62.2",
  "zerocopy",
 ]
 
