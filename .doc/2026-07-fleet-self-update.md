@@ -135,6 +135,8 @@ One `tokio::spawn` per process; states:
 
 ## 4. Shared primitive — health-gate (BRAVO owns the implementation; Charlie consumes)
 
+> **Canonical interface**: see [2026-07-supervisor-restart-interface.md](2026-07-supervisor-restart-interface.md) for the tight Bravo-facing contract — the two restart mechanisms (Bravo in-process vs Charlie supervisor-level), the Bravo watchdog → supervisor fallback path, and the shared gate algorithm with per-trigger behavior. The summary below is the original design view; the interface doc refines it.
+
 This is the contract Bravo's P1 watchdog and Charlie's updater both depend on. Bravo builds it; Charlie calls it from the new binary on boot.
 
 ### State files (in install dir)
