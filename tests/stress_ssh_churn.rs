@@ -114,10 +114,11 @@ async fn ssh_shell_survives_concurrent_connection_churn() {
         );
     }
 
-    let addr = next_local_addr();
+    // CI mode = in-process loopback server (hermetic). Canary mode = drive a real
+    // deployed ssh_shell over the tailnet (TS_STRESS_TARGET_HOST) — proves the field
+    // binary survives the same churn the CI server does.
     let accepted = Arc::new(AtomicU64::new(0));
-    let server_task = tokio::spawn(noop_server(addr, accepted.clone()));
-    wait_for_listen(addr).await;
+    let (addr, _server_task) = target_or_loopback(accepted.clone()).await;
 
     let mut total_ok = 0u64;
     let mut total_fail = 0u64;
@@ -173,7 +174,7 @@ async fn ssh_shell_survives_concurrent_connection_churn() {
         "ALL WAVES PASSED — no wedge under SSH connection churn",
     );
 
-    server_task.abort();
+    if let Some(t) = _server_task { t.abort(); }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -182,10 +183,8 @@ async fn ssh_shell_survives_sequential_handshake_burst() {
     let n = env_u64("TS_STRESS_CHURN_SEQUENTIAL", 2000);
     let per_session_timeout = env_secs("TS_STRESS_CHURN_WAVE_TIMEOUT_SECS", 30);
 
-    let addr = next_local_addr();
     let accepted = Arc::new(AtomicU64::new(0));
-    let server_task = tokio::spawn(noop_server(addr, accepted.clone()));
-    wait_for_listen(addr).await;
+    let (addr, _server_task) = target_or_loopback(accepted.clone()).await;
 
     let start = Instant::now();
     let mut ok = 0u64;
@@ -224,7 +223,7 @@ async fn ssh_shell_survives_sequential_handshake_burst() {
         "sequential burst complete",
     );
 
-    server_task.abort();
+    if let Some(t) = _server_task { t.abort(); }
     assert_eq!(fail, 0, "{fail}/{n} sequential handshakes failed — wedge reproduced");
 }
 
@@ -258,6 +257,46 @@ fn next_local_addr() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+/// Resolve the target address: either an external canary target (real deployed
+/// ssh_shell over the tailnet — `TS_STRESS_TARGET_HOST` [+ `_PORT`, default 22])
+/// or an in-process loopback NoopServer (CI hermetic mode).
+///
+/// Returns `(addr, Some(server_task))` in loopback mode, `(addr, None)` in
+/// canary mode. The caller aborts the task if present.
+async fn target_or_loopback(
+    accepted: Arc<AtomicU64>,
+) -> (SocketAddr, Option<tokio::task::JoinHandle<()>>) {
+    if let Ok(host) = std::env::var("TS_STRESS_TARGET_HOST") {
+        let port: u16 = std::env::var("TS_STRESS_TARGET_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(22);
+        let addr: SocketAddr = format!("{host}:{port}")
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid TS_STRESS_TARGET_HOST={host} port={port}: {e}"));
+        tracing::warn!(
+            %addr,
+            "CANARY MODE — driving a real deployed ssh_shell (TS_STRESS_TARGET_HOST set). \
+             No loopback server; the harness drives the field binary.",
+        );
+        // Light reachability check — fail fast with a clear message if the box is dark,
+        // rather than timing out every wave for 60s each.
+        match std::net::TcpStream::connect_timeout(
+            &addr,
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => {}
+            Err(e) => panic!("canary target {addr} unreachable (5s TCP connect): {e}"),
+        }
+        (addr, None)
+    } else {
+        let addr = next_local_addr();
+        let task = tokio::spawn(noop_server(addr, accepted));
+        wait_for_listen(addr).await;
+        (addr, Some(task))
+    }
 }
 
 async fn wait_for_listen(addr: SocketAddr) {

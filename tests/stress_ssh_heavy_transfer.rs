@@ -52,9 +52,10 @@ async fn ssh_shell_round_trips_100mb_exec_channel_losslessly() {
     let total_bytes = mib * 1024 * 1024;
     let timeout_secs = env_u64("TS_STRESS_TRANSFER_TIMEOUT_SECS", 120);
 
-    let addr = next_local_addr();
-    let server_task = tokio::spawn(cat_server(addr));
-    wait_for_listen(addr).await;
+    // CI mode = in-process cat server (hermetic). Canary mode = drive a real
+    // deployed ssh_shell over the tailnet (TS_STRESS_TARGET_HOST) — proves the
+    // field binary survives the same heavy-transfer load the CI server does.
+    let (addr, _server_task) = target_or_loopback().await;
 
     let payload = deterministic_payload(total_bytes);
     tracing::info!(total_bytes, "payload generated; spawning client");
@@ -67,11 +68,11 @@ async fn ssh_shell_round_trips_100mb_exec_channel_losslessly() {
     let received = match push.await {
         Ok(Ok(buf)) => buf,
         Ok(Err(e)) => {
-            server_task.abort();
+            if let Some(t) = _server_task { t.abort(); }
             panic!("client push+collect failed: {e:?}");
         }
         Err(_) => {
-            server_task.abort();
+            if let Some(t) = _server_task { t.abort(); }
             panic!(
                 "100 MiB transfer did not complete within {timeout_secs}s — \
                  wedge reproduced (field symptom: heavy transfer hangs)"
@@ -79,7 +80,7 @@ async fn ssh_shell_round_trips_100mb_exec_channel_losslessly() {
         }
     };
     let elapsed = start.elapsed();
-    server_task.abort();
+    if let Some(t) = _server_task { t.abort(); }
 
     assert_eq!(
         received.len(),
@@ -133,6 +134,42 @@ fn next_local_addr() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+/// Resolve the target address: either an external canary target (real deployed
+/// ssh_shell over the tailnet — `TS_STRESS_TARGET_HOST` [+ `_PORT`, default 22])
+/// or an in-process loopback CatServer (CI hermetic mode). Same shape as
+/// `stress_ssh_churn::target_or_loopback` but without an accept counter (the
+/// transfer harness doesn't track accepts).
+async fn target_or_loopback(
+) -> (SocketAddr, Option<tokio::task::JoinHandle<()>>) {
+    if let Ok(host) = std::env::var("TS_STRESS_TARGET_HOST") {
+        let port: u16 = std::env::var("TS_STRESS_TARGET_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(22);
+        let addr: SocketAddr = format!("{host}:{port}")
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid TS_STRESS_TARGET_HOST={host} port={port}: {e}"));
+        tracing::warn!(
+            %addr,
+            "CANARY MODE — driving a real deployed ssh_shell (TS_STRESS_TARGET_HOST set). \
+             No loopback server; the harness drives the field binary.",
+        );
+        match std::net::TcpStream::connect_timeout(
+            &addr,
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => {}
+            Err(e) => panic!("canary target {addr} unreachable (5s TCP connect): {e}"),
+        }
+        (addr, None)
+    } else {
+        let addr = next_local_addr();
+        let task = tokio::spawn(cat_server(addr));
+        wait_for_listen(addr).await;
+        (addr, Some(task))
+    }
 }
 
 async fn wait_for_listen(addr: SocketAddr) {
