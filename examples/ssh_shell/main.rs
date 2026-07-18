@@ -7,19 +7,18 @@
 //! Sessions are pipe-backed: no pty is allocated, and `pty-req` is refused. See the
 //! module docs on [`ShellServer`] for why.
 
-use std::{collections::HashMap, net::IpAddr, path::PathBuf, process::Stdio, sync::Arc};
+use std::{net::IpAddr, path::PathBuf, process::Stdio, sync::Arc};
 
 use clap::Parser;
 use russh::{
-    Channel, ChannelId,
+    Channel, ChannelId, ChannelMsg,
     keys::Algorithm,
-    server::{Auth, Handle, Handler, Msg, Session},
+    server::{Auth, Handler, Msg, Session},
 };
 use tailscale::ssh::TailnetServer;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, Command},
-    task::JoinSet,
+    io::AsyncWriteExt,
+    process::Command,
 };
 use tracing_subscriber::filter::LevelFilter;
 
@@ -62,175 +61,26 @@ struct Args {
 /// one and fail on the platform we care about, no session gets one: `exec` channels are
 /// unaffected (they never needed a pty), and `shell` sessions fall back to plain pipes,
 /// which costs terminal emulation but works everywhere.
+///
+/// # Channel data path (why `channel.wait()` and not the `data()` callback)
+///
+/// Each russh channel has an internal mpsc (bound 100 messages by default) that the
+/// dispatch loop fills BEFORE invoking `handler.data()`. If the handler is the only
+/// consumer of inbound data and writes serially to a slow sink (e.g. a child process's
+/// stdin pipe), the mpsc fills, the dispatch's `chan.send(Data).await` blocks, no
+/// further protocol messages are processed, and the inbound path deadlocks. With
+/// OpenSSH clients this surfaces as silent truncation around ~1 MB into a multi-MB
+/// transfer. The canonical russh pattern (used by `test_data_stream.rs` and here)
+/// drains the mpsc via `channel.wait()` / `make_reader()` in a dedicated task; the
+/// `data()` callback is left as a no-op.
 struct ShellServer {
     dev: Arc<tailscale::Device>,
     remote: std::net::SocketAddr,
-    /// stdin of the process running on each channel, once one has been started.
-    stdin: HashMap<ChannelId, ChildStdin>,
-    /// Pumps forwarding process output; dropped (and so aborted) with the connection.
-    pumps: JoinSet<()>,
 }
 
 impl TailnetServer for ShellServer {
     fn new_client(dev: Arc<tailscale::Device>, addr: std::net::SocketAddr) -> Self {
-        Self {
-            dev,
-            remote: addr,
-            stdin: HashMap::new(),
-            pumps: JoinSet::new(),
-        }
-    }
-}
-
-impl ShellServer {
-    /// Spawn `command` on the channel and wire its stdio to the channel.
-    ///
-    /// `None` runs the platform's interactive shell, i.e. an SSH `shell` request; `Some`
-    /// runs a single command line through it, i.e. an `exec` request.
-    async fn spawn(
-        &mut self,
-        channel: ChannelId,
-        command: Option<&str>,
-        session: &mut Session,
-    ) -> Result<(), <Self as Handler>::Error> {
-        let (shell, exec_flag) = if cfg!(windows) {
-            ("cmd.exe", "/C")
-        } else {
-            ("/bin/sh", "-c")
-        };
-
-        let mut cmd = Command::new(shell);
-        if let Some(command) = command {
-            cmd.arg(exec_flag).arg(command);
-        }
-
-        let child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
-
-        let mut child = match child {
-            Ok(child) => child,
-            Err(e) => {
-                tracing::error!(error = %e, %channel, shell, "spawning process");
-                // The client asked for something we could not deliver, so fail the request
-                // rather than leave it hanging on a channel that will never produce output.
-                session.channel_failure(channel)?;
-                return Ok(());
-            }
-        };
-
-        tracing::info!(
-            %channel,
-            remote = %self.remote,
-            pid = child.id(),
-            command = command.unwrap_or(shell),
-            "session started"
-        );
-
-        if let Some(stdin) = child.stdin.take() {
-            self.stdin.insert(channel, stdin);
-        }
-
-        session.channel_success(channel)?;
-        self.pump(channel, child, session.handle());
-
-        Ok(())
-    }
-
-    /// Forward the child's stdout and stderr to the channel, then report its exit status.
-    fn pump(&mut self, channel: ChannelId, mut child: Child, handle: Handle) {
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-
-        if let Some(stdout) = stdout {
-            let handle = handle.clone();
-            self.pumps.spawn(async move {
-                forward(stdout, channel, &handle, DataKind::Stdout).await;
-            });
-        }
-
-        if let Some(stderr) = stderr {
-            let handle = handle.clone();
-            self.pumps.spawn(async move {
-                forward(stderr, channel, &handle, DataKind::Stderr).await;
-            });
-        }
-
-        self.pumps.spawn(async move {
-            let status = match child.wait().await {
-                Ok(status) => status,
-                Err(e) => {
-                    tracing::error!(error = %e, %channel, "waiting on process");
-                    let _ = handle.close(channel).await;
-                    return;
-                }
-            };
-
-            // A process killed by a signal has no exit code. SSH can carry the signal
-            // itself, but mapping libc signal numbers to the protocol's names is more
-            // ceremony than this example needs; report the shell's own convention instead.
-            let code = status.code().unwrap_or(128) as u32;
-
-            // `status` is logged raw alongside the code we derive from it: a client that
-            // receives no exit-status message at all reports success, so "the client saw 0"
-            // and "the child exited 0" are indistinguishable from the client side. Only the
-            // server can tell them apart, and only if it says what it saw.
-            tracing::info!(%channel, ?status, exit_status = code, "session finished");
-
-            // Checked rather than ignored, for the same reason: silently dropping this
-            // message turns any failure into an exit 0 the client cannot question.
-            if handle.exit_status_request(channel, code).await.is_err() {
-                tracing::warn!(%channel, exit_status = code, "channel gone before exit status was sent");
-            }
-
-            let _ = handle.eof(channel).await;
-            let _ = handle.close(channel).await;
-        });
-    }
-}
-
-/// Which of the channel's two output streams bytes belong to.
-#[derive(Copy, Clone)]
-enum DataKind {
-    Stdout,
-    Stderr,
-}
-
-/// Copy `src` to the channel until EOF, as one SSH data message per read.
-async fn forward(
-    mut src: impl tokio::io::AsyncRead + Unpin,
-    channel: ChannelId,
-    handle: &Handle,
-    kind: DataKind,
-) {
-    let mut buf = vec![0u8; 32 * 1024];
-
-    loop {
-        let n = match src.read(&mut buf).await {
-            Ok(0) => return,
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e, %channel, "reading process output");
-                return;
-            }
-        };
-
-        let data = buf[..n].to_vec();
-
-        // Both of these fail only once the channel is gone, which is not an error: the
-        // client hung up and the process just has not noticed yet.
-        let sent = match kind {
-            DataKind::Stdout => handle.data(channel, data).await.map_err(|_| ()),
-            // Extended data type 1 is stderr, per RFC 4254 section 5.2.
-            DataKind::Stderr => handle.extended_data(channel, 1, data).await.map_err(|_| ()),
-        };
-
-        if sent.is_err() {
-            tracing::debug!(%channel, "channel closed while writing output");
-            return;
-        }
+        Self { dev, remote: addr }
     }
 }
 
@@ -260,31 +110,14 @@ impl Handler for ShellServer {
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
         tracing::debug!(channel = %channel.id(), remote = %self.remote, "new session");
-
+        // Per-channel driver task. Owns the child + all copy pumps. Drains the
+        // inbound mpsc via `channel.wait()` so russh's dispatch loop never blocks
+        // on `chan.send(Data)` (see struct doc).
+        let remote = self.remote;
+        tokio::spawn(async move {
+            run_session(channel, remote).await;
+        });
         Ok(true)
-    }
-
-    async fn shell_request(
-        &mut self,
-        channel: ChannelId,
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        self.spawn(channel, None, session).await
-    }
-
-    async fn exec_request(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        let Ok(command) = str::from_utf8(data) else {
-            tracing::warn!(%channel, "exec request is not utf-8");
-            session.channel_failure(channel)?;
-            return Ok(());
-        };
-
-        self.spawn(channel, Some(command), session).await
     }
 
     async fn pty_request(
@@ -298,57 +131,158 @@ impl Handler for ShellServer {
         _: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // Refuse PTY allocation (see ShellServer doc: no pty). Handled here rather
+        // than in the wait() loop because the reply goes through Session, which the
+        // loop doesn't own.
         tracing::info!(%channel, term, "refusing pty request; sessions are pipe-backed");
-
         session.channel_failure(channel)?;
-
         Ok(())
     }
+}
 
-    async fn data(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        let Some(stdin) = self.stdin.get_mut(&channel) else {
-            tracing::debug!(%channel, "data for a channel with no process");
-            return Ok(());
+/// Platform's default shell + exec flag.
+fn platform_shell() -> &'static str {
+    if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }
+}
+
+/// Flag that runs a single command line through [`platform_shell`].
+fn platform_exec_flag() -> &'static str {
+    if cfg!(windows) { "/C" } else { "-c" }
+}
+
+/// Per-channel session driver: spawn child on first exec/shell request, then
+/// concurrently copy inbound data → child stdin and child stdout/stderr → client
+/// until child exits or client closes.
+async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
+    // Wait for an exec or shell request before spawning the child.
+    let mut pending_command: Option<String> = None;
+    let mut want_shell = false;
+    loop {
+        let Some(msg) = channel.wait().await else {
+            return;
         };
-
-        // The process exiting closes its stdin, and the client may not have noticed yet;
-        // dropping the write matches what a shell pipeline does with EPIPE.
-        if let Err(e) = stdin.write_all(data).await {
-            tracing::debug!(error = %e, %channel, "writing to process stdin");
-            self.stdin.remove(&channel);
+        match msg {
+            ChannelMsg::Exec { command, .. } => {
+                pending_command = Some(String::from_utf8_lossy(&command).into_owned());
+                break;
+            }
+            ChannelMsg::RequestShell { .. } => {
+                want_shell = true;
+                break;
+            }
+            ChannelMsg::Eof | ChannelMsg::Close => return,
+            // PtyRequest is handled by the Handler::pty_request override above
+            // (which has access to Session for the channel_failure reply). The
+            // wait() loop just drops the message here.
+            _ => {}
         }
-
-        Ok(())
     }
 
-    async fn channel_eof(
-        &mut self,
-        channel: ChannelId,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        // Dropping stdin closes the pipe, which is how the process learns to finish. Without
-        // this, `ssh host cat < file` would hang forever waiting on a stdin that never ends.
-        tracing::debug!(%channel, "client eof; closing process stdin");
-        self.stdin.remove(&channel);
+    let (shell, flag, cmd_str): (&str, &str, String) = match (pending_command, want_shell) {
+        (Some(cmd), _) => (platform_shell(), platform_exec_flag(), cmd),
+        (None, true) => (platform_shell(), "", String::new()),
+        (None, false) => return,
+    };
 
-        Ok(())
+    let mut cmd = Command::new(shell);
+    if !flag.is_empty() {
+        cmd.arg(flag);
+    }
+    if !cmd_str.is_empty() {
+        cmd.arg(&cmd_str);
     }
 
-    async fn channel_close(
-        &mut self,
-        channel: ChannelId,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        tracing::debug!(%channel, "channel closed");
-        self.stdin.remove(&channel);
+    let child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, channel = %channel.id(), shell, "spawning process");
+            drop(channel.exit_status(127).await);
+            drop(channel.eof().await);
+            drop(channel.close().await);
+            return;
+        }
+    };
 
-        Ok(())
+    tracing::info!(
+        channel = %channel.id(),
+        %remote,
+        pid = child.id(),
+        command = if cmd_str.is_empty() { shell } else { &cmd_str },
+        "session started"
+    );
+
+    let child_stdin = child.stdin.take().unwrap();
+    let mut child_stdout = child.stdout.take().unwrap();
+    let mut child_stderr = child.stderr.take().unwrap();
+
+    // Outbound pumps: child stdout/stderr → client via channel.make_writer_ext.
+    // Owned writers; no borrow on `channel`, so they can move into separate tasks
+    // while `channel` is retained for the inbound loop and final exit-status send.
+    let mut stdout_writer = channel.make_writer();
+    let mut stderr_writer = channel.make_writer_ext(Some(1));
+
+    let stdout_task = tokio::spawn(async move {
+        drop(tokio::io::copy(&mut child_stdout, &mut stdout_writer).await);
+    });
+    let stderr_task = tokio::spawn(async move {
+        drop(tokio::io::copy(&mut child_stderr, &mut stderr_writer).await);
+    });
+
+    // Inbound: drain channel.wait() loop, forwarding Data to child's stdin via
+    // an unbounded mpsc. The unbounded channel decouples the wait() loop from
+    // the pipe-write (which can block on the child's stdin buffer), so the
+    // dispatch mpsc is drained promptly even when the child is slow.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let channel_id = channel.id();
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = child_stdin;
+        while let Some(chunk) = stdin_rx.recv().await {
+            if stdin.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+        // stdin drops here → child sees EOF on stdin
+    });
+
+    let mut exit_seen: Option<u32> = None;
+    loop {
+        let Some(msg) = channel.wait().await else { break };
+        match msg {
+            ChannelMsg::Data { data }
+                if stdin_tx.send(data.to_vec()).is_err() =>
+            {
+                break;
+            }
+            ChannelMsg::Data { .. } => {}
+            ChannelMsg::Eof => break,
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit_seen = Some(exit_status);
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
     }
+    drop(stdin_tx);
+    drop(stdin_task.await);
+    drop(stdout_task.await);
+    drop(stderr_task.await);
+
+    let status = child.wait().await;
+    let code = match (exit_seen, status) {
+        (Some(c), _) => c,
+        (None, Ok(s)) => s.code().unwrap_or(128) as u32,
+        (None, Err(_)) => 128,
+    };
+    tracing::info!(channel = %channel_id, exit_status = code, "session finished");
+    drop(channel.exit_status(code).await);
+    drop(channel.eof().await);
+    drop(channel.close().await);
 }
 
 #[tokio::main(flavor = "multi_thread")]
