@@ -1,0 +1,26 @@
+[Unit]
+Description=Koidra Gateway — backup channel (tailnet access service, redundant)
+After=network-online.target koidra-gateway-primary.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=AUTHKEY=${KOIDRA_BACKUP_AUTHKEY}
+Environment=KOIDRA_MANIFEST_URL=${KOIDRA_MANIFEST_URL}
+Environment=KOIDRA_TARGET=x86_64-unknown-linux-musl
+WorkingDirectory=/opt/koidra-gateway
+ExecStart=/opt/koidra-gateway/run.sh backup 2223
+
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=2
+StartLimitIntervalSec=60
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/opt/koidra-gateway
+
+[Install]
+WantedBy=multi-user.target
