@@ -48,6 +48,26 @@ impl Config {
         })
     }
 
+    /// Create a new config with [`key_state`](Config::key_state) populated from the specified
+    /// key file AND remaining fields populated from environment variables.
+    ///
+    /// This is the combination of [`Config::default_with_key_file`] and
+    /// [`Config::default_from_env`]: the key file provides the node identity, the environment
+    /// provides operator-controlled settings (`TS_HOSTNAME`, `TS_CONTROL_URL`). It is the
+    /// appropriate entry point for fleet-launched binaries (systemd units, scheduled tasks,
+    /// supervisor scripts) where the operator sets the hostname via env and the identity via
+    /// a per-channel key file.
+    ///
+    /// See [`load_key_file`] for the key-file loading semantics.
+    pub async fn default_from_env_with_key_file(
+        p: impl AsRef<Path>,
+    ) -> Result<Self, crate::Error> {
+        Ok(Config {
+            key_state: load_key_file(p, Default::default()).await?,
+            ..Self::default_from_env()
+        })
+    }
+
     /// Construct a default config, setting certain fields from environment variables.
     ///
     /// The fields are only set if the corresponding environment variable is present, using
