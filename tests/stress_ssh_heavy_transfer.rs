@@ -117,12 +117,14 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 fn init_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .try_init();
+    drop(
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .try_init(),
+    );
 }
 
 fn next_local_addr() -> SocketAddr {
@@ -233,9 +235,9 @@ async fn run_channel_loop(mut channel: russh::Channel<Msg>) {
     let mut child = match child {
         Ok(c) => c,
         Err(_e) => {
-            let _ = channel.exit_status(127).await;
-            let _ = channel.eof().await;
-            let _ = channel.close().await;
+            drop(channel.exit_status(127).await);
+            drop(channel.eof().await);
+            drop(channel.close().await);
             return;
         }
     };
@@ -278,17 +280,17 @@ async fn run_channel_loop(mut channel: russh::Channel<Msg>) {
         }
     }
     drop(stdin_tx);
-    let _ = stdin_task.await;
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    drop(stdin_task.await);
+    drop(stdout_task.await);
+    drop(stderr_task.await);
 
     let status = child.wait().await.ok();
     let code = exit_seen
         .or_else(|| status.and_then(|s| s.code().map(|c| c as u32)))
         .unwrap_or(128);
-    let _ = channel.exit_status(code).await;
-    let _ = channel.eof().await;
-    let _ = channel.close().await;
+    drop(channel.exit_status(code).await);
+    drop(channel.eof().await);
+    drop(channel.close().await);
 }
 
 // === Client side ===

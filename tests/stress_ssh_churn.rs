@@ -197,7 +197,7 @@ async fn ssh_shell_survives_sequential_handshake_burst() {
             let res = client_handshake(addr)
                 .await
                 .map_err(|e| format!("{e:?}"));
-            let _ = tx.send(res);
+            drop(tx.send(res));
         });
         match tokio::time::timeout(
             Duration::from_secs(per_session_timeout),
@@ -242,12 +242,14 @@ fn env_secs(name: &str, default: u64) -> u64 {
 }
 
 fn init_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .try_init();
+    drop(
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .try_init(),
+    );
 }
 
 fn next_local_addr() -> SocketAddr {
@@ -356,7 +358,7 @@ impl Handler for NoopHandler {
                     _ => {}
                 }
             }
-            let _ = write.close().await;
+            drop(write.close().await);
         });
         Ok(true)
     }
