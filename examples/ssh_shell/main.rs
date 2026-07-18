@@ -22,6 +22,13 @@ use tokio::{
 };
 use tracing_subscriber::filter::LevelFilter;
 
+// Updater module: state machine + atomic swap + rollback stack + tests.
+// main.rs wiring (--manifest-url arg + spawn + write_boot_state) is DEFERRED until
+// bravo-4's P2 (exec-channel fix) lands on koidra/hardening-rebuild to avoid a main.rs
+// merge conflict. See `.doc/2026-07-fleet-self-update.md` + `.doc/2026-07-supervisor-restart-interface.md`.
+#[allow(dead_code)]
+mod updater;
+
 /// Run an SSH server on the tailnet serving exec and shell sessions.
 ///
 /// There is no application-level authentication. A peer that reaches the listen port has
