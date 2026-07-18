@@ -21,6 +21,7 @@ mod error;
 mod multiderp;
 mod netmon;
 mod netstack_actor;
+mod offtailnet_watchdog;
 mod packetfilter;
 pub mod peer_tracker;
 mod registry;
