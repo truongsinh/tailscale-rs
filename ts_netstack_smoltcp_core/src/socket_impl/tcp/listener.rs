@@ -98,8 +98,9 @@ impl Netstack {
                 // close any sockets in `CLOSE-WAIT` or that moved back to `LISTEN`. All other
                 // states are unexpected.
                 listener.half_open_queue.retain(|half_open| {
-                    let sock = self.socket_set.get_mut::<tcp::Socket>(*half_open);
-                    let state = sock.state();
+                    // Read the state without holding a long-lived mutable borrow, so the
+                    // terminal-state arm below can `remove` the socket.
+                    let state = self.socket_set.get::<tcp::Socket>(*half_open).state();
                     let _span = tracing::trace_span!(
                         "half_open_queue",
                         accept_queue_len = listener.accept_queue.len(),
@@ -132,7 +133,7 @@ impl Netstack {
                             // accept loop and surface data to callers, as it has no handle to the
                             // socket in its queues.
                             tracing::trace!("half-open socket moved to {state}, closing");
-                            sock.close();
+                            self.socket_set.get_mut::<tcp::Socket>(*half_open).close();
                             self.pending_tcp_closes.push(*half_open);
                             if self.pending_tcp_closes.len() > 10000 {
                                 tracing::warn!("large number of pending closes");
@@ -140,7 +141,15 @@ impl Netstack {
                             false
                         }
                         _ => {
-                            tracing::warn!("half-open socket in unexpected state, dropping");
+                            // The socket left the half-open lifecycle in a terminal state without
+                            // our accept loop moving it — e.g. smoltcp exhausted its SYN-ACK
+                            // retransmits against a peer that vanished mid-handshake and aborted
+                            // the connection (Closed/TimeWait/Closing/...). Reap it: `remove`
+                            // frees its socket_set slot and both 16 KiB buffers. Previously this
+                            // arm dropped the queue entry WITHOUT removing the socket, leaking a
+                            // slot + 32 KiB per churned half-open connection.
+                            tracing::trace!("half-open socket in terminal state, reaping");
+                            self.socket_set.remove(*half_open);
                             false
                         }
                     }
@@ -149,8 +158,9 @@ impl Netstack {
                 // De-queue a single socket in the `ESTABLISHED` state from the `accept_queue` and
                 // return it to become a `TcpStream`.
                 while let Some(accept) = listener.accept_queue.pop_front() {
-                    let sock = self.socket_set.get_mut::<tcp::Socket>(accept);
-                    let state = sock.state();
+                    // Read the state without holding a long-lived mutable borrow, so the
+                    // terminal-state arm below can `remove` the socket.
+                    let state = self.socket_set.get::<tcp::Socket>(accept).state();
                     let _span = tracing::trace_span!(
                         "accept_queue",
                         half_open_queue_len = listener.half_open_queue.len(),
@@ -163,26 +173,40 @@ impl Netstack {
 
                     match state {
                         tcp::State::Established => {
-                            tracing::trace!("accept socket accepted, returning")
+                            // Fail-open: an Established socket always has a remote endpoint, but
+                            // never panic on the data path — if it is somehow absent, reap and
+                            // move on rather than unwrap.
+                            match self.socket_set.get::<tcp::Socket>(accept).remote_endpoint() {
+                                Some(remote) => {
+                                    tracing::trace!("accept socket accepted, returning");
+                                    return TcpListenResponse::Accepted {
+                                        handle: accept,
+                                        remote: SocketAddr::new(remote.addr.into(), remote.port),
+                                    }
+                                    .into();
+                                }
+                                None => {
+                                    tracing::warn!("established accept socket has no remote, reaping");
+                                    self.socket_set.remove(accept);
+                                    continue;
+                                }
+                            }
                         }
                         tcp::State::CloseWait => {
                             tracing::trace!(?state, "accept socket no longer established, closing");
-                            sock.close();
+                            self.socket_set.get_mut::<tcp::Socket>(accept).close();
                             self.pending_tcp_closes.push(accept);
                             continue;
                         }
                         _ => {
-                            tracing::warn!(?state, "accept socket in unexpected state, dropping");
+                            // Terminal/unexpected state: reap it so its buffers are freed.
+                            // Previously this arm dropped the queue entry WITHOUT removing the
+                            // socket, leaking a socket_set slot + 32 KiB.
+                            tracing::warn!(?state, "accept socket in unexpected state, reaping");
+                            self.socket_set.remove(accept);
                             continue;
                         }
                     }
-
-                    let remote = sock.remote_endpoint().unwrap();
-                    return TcpListenResponse::Accepted {
-                        handle: accept,
-                        remote: SocketAddr::new(remote.addr.into(), remote.port),
-                    }
-                    .into();
                 }
 
                 tracing::trace!("accept queue empty");
@@ -252,6 +276,21 @@ impl Netstack {
                     listener
                         .half_open_queue
                         .push_back(listener.current_socket_handle);
+
+                    // Bound the half-open backlog. A flood of never-completed handshakes
+                    // (connection churn, or clients that vanish mid-handshake) would otherwise
+                    // grow `half_open_queue` — and the unbounded `socket_set` — without limit,
+                    // leaking two `tcp_buffer_size` buffers per SYN and slowing every
+                    // O(sockets) `poll_egress`. Reap the oldest half-open(s) beyond the cap,
+                    // freeing their buffers immediately; a bounded backlog is the standard SYN
+                    // defence and matches how a real OS accept queue drops the oldest pending
+                    // handshake under pressure.
+                    while listener.half_open_queue.len() > self.config.tcp_half_open_backlog {
+                        if let Some(stale) = listener.half_open_queue.pop_front() {
+                            self.socket_set.remove(stale);
+                            tracing::trace!(?stale, "reaped oldest half-open over backlog cap");
+                        }
+                    }
                 }
 
                 tcp::State::Established => {

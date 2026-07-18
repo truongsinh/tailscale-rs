@@ -19,6 +19,15 @@ pub struct TcpStream {
 
     #[cfg(any(feature = "tokio", feature = "futures-io"))]
     read_fut: Option<PinBoxFut<Result<Bytes, netcore::Error>>>,
+    /// Bytes received from the netstack that did not fit the caller's buffer on the poll
+    /// that produced them. A pending `read_fut` captures `cap = buf.len()` when it is first
+    /// created; if that read is cancelled while pending (e.g. a timed-out large read) the
+    /// future survives sized to the *large* cap and can later resolve into a *smaller*
+    /// buffer. `poll_read` copies at most `buf.len()` bytes and parks the remainder here,
+    /// draining it (in order, before issuing any new `Recv`) on the following polls — so no
+    /// copy ever overflows the destination and no received byte is dropped.
+    #[cfg(any(feature = "tokio", feature = "futures-io"))]
+    read_stash: Bytes,
     #[cfg(any(feature = "tokio", feature = "futures-io"))]
     write_fut: Option<PinBoxFut<Result<usize, netcore::Error>>>,
 }
@@ -38,6 +47,9 @@ impl TcpStream {
 
             #[cfg(any(feature = "tokio", feature = "futures-io"))]
             read_fut: None,
+
+            #[cfg(any(feature = "tokio", feature = "futures-io"))]
+            read_stash: Bytes::new(),
 
             #[cfg(any(feature = "tokio", feature = "futures-io"))]
             write_fut: None,
@@ -171,6 +183,19 @@ impl TcpStream {
     ) -> core::task::Poll<std::io::Result<usize>> {
         use netcore::HasChannel;
 
+        // Drain any bytes stashed from a previous over-read *before* issuing a new `Recv`.
+        // This both preserves byte order across a buffer-size change (the stash carries the
+        // untransferred tail of a cancelled large read) and applies bridge-level
+        // back-pressure — we never pull more from the netstack while the caller still owes
+        // us a read of already-received data. An empty destination buffer serves nothing.
+        if !self.read_stash.is_empty() && !buf.is_empty() {
+            let n = self.read_stash.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.read_stash[..n]);
+            // Advance past the served prefix; the remainder (if any) stays stashed.
+            let _served = self.read_stash.split_to(n);
+            return core::task::Poll::Ready(Ok(n));
+        }
+
         let handle = self.handle;
         let cap = buf.len();
 
@@ -197,13 +222,21 @@ impl TcpStream {
 
                 Some(x) => {
                     let poll_result = x.as_mut().poll(cx);
-                    let ret = core::task::ready!(poll_result)?;
-
-                    buf[..ret.len()].copy_from_slice(&ret);
+                    let mut ret = core::task::ready!(poll_result)?;
 
                     self.read_fut.take();
 
-                    break core::task::Poll::Ready(Ok(ret.len()));
+                    // A read_fut created with a larger `cap` (before a cancellation) can
+                    // resolve into a smaller buffer. Copy at most `buf.len()` bytes so the
+                    // destination slice never overflows, and stash the untransferred tail
+                    // for the next poll instead of dropping it.
+                    let n = ret.len().min(buf.len());
+                    buf[..n].copy_from_slice(&ret[..n]);
+                    if n < ret.len() {
+                        self.read_stash = ret.split_off(n);
+                    }
+
+                    break core::task::Poll::Ready(Ok(n));
                 }
             }
         }

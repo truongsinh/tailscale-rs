@@ -99,3 +99,11 @@ harness = false
 [[test]]
 name = "wrong_ip_version"
 required-features = ["tokio"]
+
+[[test]]
+name = "tcp_heavy_transfer"
+required-features = ["tokio"]
+
+[[test]]
+name = "tcp_accept_churn"
+required-features = ["tokio"]
