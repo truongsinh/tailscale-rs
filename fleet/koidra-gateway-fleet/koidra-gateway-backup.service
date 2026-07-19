@@ -13,6 +13,9 @@ Environment=TS_HOSTNAME=vn-office-dev-server-backup
 # the box (systemctl edit / EnvironmentFile drop-in) before enabling.
 Environment=AUTHKEY=tskey-auth-PLACEHOLDER-bake-real-key-here
 Environment=KOIDRA_TARGET=x86_64-unknown-linux-musl
+# REQUIRED runtime gate: the binary aborts with `UnstableEnvVar` at startup without
+# this (checked in src/lib.rs init). run.sh also exports it (belt-and-braces).
+Environment=TS_RS_EXPERIMENT=this_is_unstable_software
 WorkingDirectory=/home/sinh/koidra-gateway
 ExecStart=/home/sinh/koidra-gateway/run.sh backup 2223
 

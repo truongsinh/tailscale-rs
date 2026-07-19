@@ -30,6 +30,12 @@
 
 set -euo pipefail
 
+# REQUIRED runtime gate: the binary aborts with `Error: UnstableEnvVar` at startup
+# unless this is set (checked in src/lib.rs init). Export it here, per-process, so a
+# launch never depends on a machine-wide/unit env var (belt-and-braces with the unit's
+# Environment=). The old koidra-ssh launcher set it; the rebrand must keep it.
+export TS_RS_EXPERIMENT=this_is_unstable_software
+
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 channel="${1:?usage: run.sh <channel> <port> [exe-override]}"
 port="${2:?usage: run.sh <channel> <port> [exe-override]}"

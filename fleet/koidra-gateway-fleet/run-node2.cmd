@@ -50,6 +50,12 @@ setlocal enabledelayedexpansion
 set "DIR=%~dp0"
 set "DIR=%DIR:~0,-1%"
 
+rem ---- REQUIRED runtime gate: the binary aborts with `Error: UnstableEnvVar` at
+rem startup unless this is set (checked in src/lib.rs init). The old koidra-ssh
+rem run-node.cmd set it; it must be set HERE before every launch, per-process, so
+rem the box does NOT depend on a machine-wide env var. --------------------------- rem
+set "TS_RS_EXPERIMENT=this_is_unstable_software"
+
 rem ---- fast-exit backoff config (mirror of the old supervisor.vbs values) --- rem
 set "HEALTHY_SECS=20"
 set "BASE_DELAY=5"
