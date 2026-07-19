@@ -541,9 +541,13 @@ impl kameo::Actor for OffTailnetWatchdog {
             duration_from_env_or(T_DETECT_ENV, DEFAULT_T_DETECT, MIN_T_DETECT),
             seed,
         );
+        // The stall-window floor is computed from the JITTERED threshold — the same
+        // basis the uniderp trackers detect with — so three jittered stalls always
+        // fit inside the window (an unjittered basis could under-floor by up to 20%).
         let threshold_basis = RxStallConfig::from_env()
+            .with_jitter(seed)
             .stall_threshold
-            .unwrap_or(RxStallConfig::DEFAULT_STALL_THRESHOLD);
+            .unwrap_or(jittered(RxStallConfig::DEFAULT_STALL_THRESHOLD, seed));
         let stall_window = stall_window_from_parts(
             std::env::var(STALL_WINDOW_ENV).ok().as_deref(),
             threshold_basis,
