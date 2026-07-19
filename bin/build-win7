@@ -9,7 +9,7 @@
 #
 # Additional arguments are passed through to `cargo build`, e.g.:
 #
-#     $ bin/build-win7 --example ssh_shell
+#     $ bin/build-win7 --example koidra_gateway
 #
 # builds just that example instead of the default scope.
 #
