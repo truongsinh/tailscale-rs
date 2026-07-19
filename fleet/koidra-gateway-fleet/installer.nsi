@@ -181,7 +181,11 @@ Function .onInit
     ${If} ${FileExists} "$ProgramData\koidra-ssh\*.*"
         ; Admin layout present.
         ${If} $IsAdmin != 1
-            MessageBox MB_OK|MB_ICONSTOP "An admin (ProgramData) koidra-ssh install is present at $ProgramData\koidra-ssh, but this installer is NOT running elevated.$\n$\nRe-run koidra-gateway-setup.exe as Administrator. Refusing to install a divergent per-user copy with fresh keys next to the live SYSTEM stack."
+            DetailPrint "ABORT: admin (ProgramData) koidra-ssh install present but installer not elevated — re-run as Administrator."
+            SetErrorLevel 2
+            ${IfNot} ${Silent}
+                MessageBox MB_OK|MB_ICONSTOP "An admin (ProgramData) koidra-ssh install is present at $ProgramData\koidra-ssh, but this installer is NOT running elevated.$\n$\nRe-run koidra-gateway-setup.exe as Administrator. Refusing to install a divergent per-user copy with fresh keys next to the live SYSTEM stack."
+            ${EndIf}
             Abort
         ${EndIf}
         StrCpy $BaseDir $ProgramData
@@ -256,7 +260,10 @@ Function DoFinalize
     SetShellVarContext all
     Delete "$SMSTARTUP\KoidraSSH.lnk"
     DetailPrint "FINALIZE done. Old $ProgramData\koidra-ssh / $LocalAppDir\koidra-ssh dir NOT deleted (coordinator cleanup pass)."
-    MessageBox MB_OK "Finalize complete: old KoidraSSH-* tasks and KoidraSSH.lnk removed. The old koidra-ssh directory is left on disk for the coordinator's list-before-delete pass."
+    DetailPrint "Finalize complete: old KoidraSSH-* tasks and KoidraSSH.lnk removed; old koidra-ssh dir left on disk."
+    ${IfNot} ${Silent}
+        MessageBox MB_OK "Finalize complete: old KoidraSSH-* tasks and KoidraSSH.lnk removed. The old koidra-ssh directory is left on disk for the coordinator's list-before-delete pass."
+    ${EndIf}
 FunctionEnd
 
 ; --------------------------------------------------------------------------- ;
@@ -329,7 +336,11 @@ Section "Koidra Gateway (required)" SecCore
         nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\check-console.ps1"'
         Pop $0
         ${If} $0 != 0
-            MessageBox MB_OK|MB_ICONSTOP "CONSOLE-ONLY ABORT: this installer appears to be running over the box's own koidra SSH channel (an ssh_shell* ancestor was detected). The upgrade stops the old stack, which would kill this transport mid-run and brick the box (no reboot allowed).$\n$\nRun it AT THE CONSOLE (physical / RDP). If you are certain this is a console session and the detection is wrong, re-run with /CONSOLE."
+            DetailPrint "CONSOLE-ONLY ABORT: over-SSH run detected (ssh_shell* ancestor) — run at console or re-run with /CONSOLE."
+            SetErrorLevel 2
+            ${IfNot} ${Silent}
+                MessageBox MB_OK|MB_ICONSTOP "CONSOLE-ONLY ABORT: this installer appears to be running over the box's own koidra SSH channel (an ssh_shell* ancestor was detected). The upgrade stops the old stack, which would kill this transport mid-run and brick the box (no reboot allowed).$\n$\nRun it AT THE CONSOLE (physical / RDP). If you are certain this is a console session and the detection is wrong, re-run with /CONSOLE."
+            ${EndIf}
             Abort
         ${EndIf}
         DetailPrint "Console guard: no ssh_shell* ancestor detected (not an over-SSH run)."
@@ -358,11 +369,19 @@ Section "Koidra Gateway (required)" SecCore
     ; ---- IDENTITY (§2) --------------------------------------------------- ;
     ${If} $Mode == "upgrade"
         ${IfNot} ${FileExists} "$OldDir\primary.json"
-            MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\primary.json is missing. Refusing to mint a fresh node identity. Stage the box's real identity json or investigate before proceeding."
+            DetailPrint "UPGRADE ABORT: $OldDir\primary.json is missing — refusing to mint a fresh node identity."
+            SetErrorLevel 2
+            ${IfNot} ${Silent}
+                MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\primary.json is missing. Refusing to mint a fresh node identity. Stage the box's real identity json or investigate before proceeding."
+            ${EndIf}
             Abort
         ${EndIf}
         ${IfNot} ${FileExists} "$OldDir\backup.json"
-            MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\backup.json is missing. Refusing to mint a fresh node identity."
+            DetailPrint "UPGRADE ABORT: $OldDir\backup.json is missing — refusing to mint a fresh node identity."
+            SetErrorLevel 2
+            ${IfNot} ${Silent}
+                MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\backup.json is missing. Refusing to mint a fresh node identity."
+            ${EndIf}
             Abort
         ${EndIf}
         ; M1: existence is NOT enough — a 0-byte / truncated old json passes
@@ -378,7 +397,11 @@ Section "Koidra Gateway (required)" SecCore
             StrCpy $7 0
         ${EndIf}
         ${If} $7 <= 0
-            MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\primary.json is 0-byte / unreadable (a corrupt identity file). The box is already broken; refusing to copy it onto the new layout. Investigate + restore a good json before proceeding."
+            DetailPrint "UPGRADE ABORT: $OldDir\primary.json is 0-byte / unreadable (corrupt identity) — refusing to copy it onto the new layout."
+            SetErrorLevel 2
+            ${IfNot} ${Silent}
+                MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\primary.json is 0-byte / unreadable (a corrupt identity file). The box is already broken; refusing to copy it onto the new layout. Investigate + restore a good json before proceeding."
+            ${EndIf}
             Abort
         ${EndIf}
         ClearErrors
@@ -390,7 +413,11 @@ Section "Koidra Gateway (required)" SecCore
             StrCpy $7 0
         ${EndIf}
         ${If} $7 <= 0
-            MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\backup.json is 0-byte / unreadable (a corrupt identity file). Refusing to propagate a broken identity onto the new layout."
+            DetailPrint "UPGRADE ABORT: $OldDir\backup.json is 0-byte / unreadable (corrupt identity) — refusing to propagate a broken identity."
+            SetErrorLevel 2
+            ${IfNot} ${Silent}
+                MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\backup.json is 0-byte / unreadable (a corrupt identity file). Refusing to propagate a broken identity onto the new layout."
+            ${EndIf}
             Abort
         ${EndIf}
         ; Byte-identical copy -> same nodeId + same 100.x IP.
@@ -422,7 +449,11 @@ Section "Koidra Gateway (required)" SecCore
             ${If} ${FileExists} "$EXEDIR\primary.json"
                 CopyFiles /SILENT "$EXEDIR\primary.json" "$INSTDIR\primary.json"
             ${Else}
-                MessageBox MB_OK|MB_ICONSTOP "REPAIR ABORT: $INSTDIR\primary.json missing and no staged copy beside the installer."
+                DetailPrint "REPAIR ABORT: $INSTDIR\primary.json missing and no staged copy beside the installer."
+                SetErrorLevel 2
+                ${IfNot} ${Silent}
+                    MessageBox MB_OK|MB_ICONSTOP "REPAIR ABORT: $INSTDIR\primary.json missing and no staged copy beside the installer."
+                ${EndIf}
                 Abort
             ${EndIf}
         ${EndIf}
@@ -430,7 +461,11 @@ Section "Koidra Gateway (required)" SecCore
             ${If} ${FileExists} "$EXEDIR\backup.json"
                 CopyFiles /SILENT "$EXEDIR\backup.json" "$INSTDIR\backup.json"
             ${Else}
-                MessageBox MB_OK|MB_ICONSTOP "REPAIR ABORT: $INSTDIR\backup.json missing and no staged copy beside the installer."
+                DetailPrint "REPAIR ABORT: $INSTDIR\backup.json missing and no staged copy beside the installer."
+                SetErrorLevel 2
+                ${IfNot} ${Silent}
+                    MessageBox MB_OK|MB_ICONSTOP "REPAIR ABORT: $INSTDIR\backup.json missing and no staged copy beside the installer."
+                ${EndIf}
                 Abort
             ${EndIf}
         ${EndIf}
@@ -454,11 +489,19 @@ Section "Koidra Gateway (required)" SecCore
         nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\extract-authkey.ps1" "$OldDir" "$INSTDIR\authkey.txt"'
         Pop $0
         ${If} $0 != 0
-            MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: could not extract the baked -k tskey-... auth key from $OldDir\run-node.cmd (exit $0). Refusing to ship an empty key."
+            DetailPrint "UPGRADE ABORT: could not extract the baked -k tskey-... auth key from $OldDir\run-node.cmd (exit $0)."
+            SetErrorLevel 2
+            ${IfNot} ${Silent}
+                MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: could not extract the baked -k tskey-... auth key from $OldDir\run-node.cmd (exit $0). Refusing to ship an empty key."
+            ${EndIf}
             Abort
         ${EndIf}
         ${IfNot} ${FileExists} "$INSTDIR\authkey.txt"
-            MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: authkey.txt was not produced from $OldDir."
+            DetailPrint "UPGRADE ABORT: authkey.txt was not produced from $OldDir."
+            SetErrorLevel 2
+            ${IfNot} ${Silent}
+                MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: authkey.txt was not produced from $OldDir."
+            ${EndIf}
             Abort
         ${EndIf}
         DetailPrint "Auth key: extracted baked token from $OldDir -> authkey.txt."
@@ -471,7 +514,11 @@ Section "Koidra Gateway (required)" SecCore
         ${Else}
             ReadEnvStr $2 "KOIDRA_PRIMARY_AUTHKEY"
             ${If} $2 == ""
-                MessageBox MB_OK|MB_ICONSTOP "REPROVISION ABORT: no auth key supplied. Stage authkey.txt beside the installer or set KOIDRA_PRIMARY_AUTHKEY before re-running with /REPROVISION."
+                DetailPrint "REPROVISION ABORT: no auth key supplied — stage authkey.txt or set KOIDRA_PRIMARY_AUTHKEY."
+                SetErrorLevel 2
+                ${IfNot} ${Silent}
+                    MessageBox MB_OK|MB_ICONSTOP "REPROVISION ABORT: no auth key supplied. Stage authkey.txt beside the installer or set KOIDRA_PRIMARY_AUTHKEY before re-running with /REPROVISION."
+                ${EndIf}
                 Abort
             ${EndIf}
             FileOpen $3 "$INSTDIR\authkey.txt" w
@@ -502,7 +549,11 @@ Section "Koidra Gateway (required)" SecCore
             ${Else}
                 ReadEnvStr $2 "KOIDRA_PRIMARY_AUTHKEY"
                 ${If} $2 == ""
-                    MessageBox MB_OK|MB_ICONSTOP "ABORT: no auth key for a fresh install (existing authkey.txt is absent or empty). Stage authkey.txt beside the installer or set KOIDRA_PRIMARY_AUTHKEY before running."
+                    DetailPrint "ABORT: no auth key for a fresh install (authkey.txt absent or empty) — stage authkey.txt or set KOIDRA_PRIMARY_AUTHKEY."
+                    SetErrorLevel 2
+                    ${IfNot} ${Silent}
+                        MessageBox MB_OK|MB_ICONSTOP "ABORT: no auth key for a fresh install (existing authkey.txt is absent or empty). Stage authkey.txt beside the installer or set KOIDRA_PRIMARY_AUTHKEY before running."
+                    ${EndIf}
                     Abort
                 ${EndIf}
                 FileOpen $3 "$INSTDIR\authkey.txt" w
@@ -548,7 +599,11 @@ Section "Start koidra-gateway channels" SecStart
             nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\stop-old-stack.ps1" "$OldDir" "$IsAdmin" backup'
             Pop $0
             ${If} $0 != 0
-                MessageBox MB_OK|MB_ICONSTOP "ABORT: old BACKUP ssh_shell processes still running after the stop attempt (exit $0). Refusing to start the new backup over a live old one (two processes on one keyfile = orphan node). Old PRIMARY was NOT touched — the box is still reachable. Resolve at console, then re-run."
+                DetailPrint "ABORT: old BACKUP ssh_shell processes still running after stop (exit $0) — old PRIMARY untouched, box reachable."
+                SetErrorLevel 2
+                ${IfNot} ${Silent}
+                    MessageBox MB_OK|MB_ICONSTOP "ABORT: old BACKUP ssh_shell processes still running after the stop attempt (exit $0). Refusing to start the new backup over a live old one (two processes on one keyfile = orphan node). Old PRIMARY was NOT touched — the box is still reachable. Resolve at console, then re-run."
+                ${EndIf}
                 Abort
             ${EndIf}
             nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-backup"'
@@ -560,7 +615,11 @@ Section "Start koidra-gateway channels" SecStart
             nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\stop-old-stack.ps1" "$OldDir" "$IsAdmin" primary'
             Pop $0
             ${If} $0 != 0
-                MessageBox MB_OK|MB_ICONSTOP "ABORT: old PRIMARY ssh_shell processes still running after the stop attempt (exit $0). New BACKUP is up (box reachable); refusing to start the new primary over a live old one. Resolve at console, then re-run."
+                DetailPrint "ABORT: old PRIMARY ssh_shell processes still running after stop (exit $0) — new BACKUP up, box reachable."
+                SetErrorLevel 2
+                ${IfNot} ${Silent}
+                    MessageBox MB_OK|MB_ICONSTOP "ABORT: old PRIMARY ssh_shell processes still running after the stop attempt (exit $0). New BACKUP is up (box reachable); refusing to start the new primary over a live old one. Resolve at console, then re-run."
+                ${EndIf}
                 Abort
             ${EndIf}
             nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-primary"'
@@ -588,7 +647,11 @@ Section "Start koidra-gateway channels" SecStart
             nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\stop-old-stack.ps1" "$OldDir" "$IsAdmin" backup'
             Pop $0
             ${If} $0 != 0
-                MessageBox MB_OK|MB_ICONSTOP "ABORT: old BACKUP loop/processes still running after the stop attempt (exit $0). Old PRIMARY was NOT touched (box reachable). Resolve at console, then re-run."
+                DetailPrint "ABORT: old BACKUP loop/processes still running after stop (exit $0) — old PRIMARY untouched, box reachable."
+                SetErrorLevel 2
+                ${IfNot} ${Silent}
+                    MessageBox MB_OK|MB_ICONSTOP "ABORT: old BACKUP loop/processes still running after the stop attempt (exit $0). Old PRIMARY was NOT touched (box reachable). Resolve at console, then re-run."
+                ${EndIf}
                 Abort
             ${EndIf}
             Exec '"$SYSDIR\wscript.exe" "$INSTDIR\start-backup.vbs"'
@@ -598,7 +661,11 @@ Section "Start koidra-gateway channels" SecStart
             nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\stop-old-stack.ps1" "$OldDir" "$IsAdmin" primary'
             Pop $0
             ${If} $0 != 0
-                MessageBox MB_OK|MB_ICONSTOP "ABORT: old PRIMARY loop/processes still running after the stop attempt (exit $0). New BACKUP is up (box reachable). Resolve at console, then re-run."
+                DetailPrint "ABORT: old PRIMARY loop/processes still running after stop (exit $0) — new BACKUP up, box reachable."
+                SetErrorLevel 2
+                ${IfNot} ${Silent}
+                    MessageBox MB_OK|MB_ICONSTOP "ABORT: old PRIMARY loop/processes still running after the stop attempt (exit $0). New BACKUP is up (box reachable). Resolve at console, then re-run."
+                ${EndIf}
                 Abort
             ${EndIf}
             Exec '"$SYSDIR\wscript.exe" "$INSTDIR\start-primary.vbs"'
@@ -616,7 +683,10 @@ Section "-TwoPhaseReminder"
     ; §7: old persistence is intentionally LEFT INTACT this run.
     DetailPrint "TWO-PHASE: old KoidraSSH-* tasks / KoidraSSH.lnk LEFT INTACT as boot fallback."
     DetailPrint "After EXTERNAL validation, run: koidra-gateway-setup.exe /FINALIZE  to remove old persistence."
-    MessageBox MB_OK "koidra-gateway installed and started.$\n$\nThe OLD koidra-ssh persistence (tasks / Startup shortcut) and directory are LEFT INTACT as the boot fallback.$\n$\nAfter the coordinator's external validation passes (nodeId + IP + clientVersion unchanged, real SSH banner+exec, rx advancing), run:$\n    koidra-gateway-setup.exe /FINALIZE$\nto remove the old persistence. Directory deletion is a separate coordinator pass."
+    DetailPrint "koidra-gateway installed and started; OLD koidra-ssh persistence left intact as boot fallback (run /FINALIZE after external validation)."
+    ${IfNot} ${Silent}
+        MessageBox MB_OK "koidra-gateway installed and started.$\n$\nThe OLD koidra-ssh persistence (tasks / Startup shortcut) and directory are LEFT INTACT as the boot fallback.$\n$\nAfter the coordinator's external validation passes (nodeId + IP + clientVersion unchanged, real SSH banner+exec, rx advancing), run:$\n    koidra-gateway-setup.exe /FINALIZE$\nto remove the old persistence. Directory deletion is a separate coordinator pass."
+    ${EndIf}
 SectionEnd
 
 ; --------------------------------------------------------------------------- ;
