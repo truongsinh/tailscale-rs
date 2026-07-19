@@ -377,6 +377,7 @@ impl kameo::Actor for Uniderp {
             keys: args.env.keys.node_keys.clone(),
             from_dataplane: Arc::new(Mutex::new(from_dataplane)),
             rx_stall_config,
+            send_timeout: Runner::SEND_TIMEOUT,
             env: args.env.clone(),
         };
 
@@ -502,6 +503,10 @@ struct Runner {
     keys: NodeKeyPair,
     /// rx-stall detection thresholds (env-tunable, defaults conservative).
     rx_stall_config: RxStallConfig,
+    /// Upper bound on a single DERP send (see [`Runner::SEND_TIMEOUT`]).
+    /// Injectable so the wedged-send recycle path is testable with a short bound;
+    /// production always uses the default constant.
+    send_timeout: Duration,
     /// Retained so the runner can publish [`RxStallEvent`]s on the bus.
     env: Env,
 }
@@ -607,7 +612,18 @@ impl Runner {
 
         if let Some(pending) = pending {
             tracing::trace!("sending queued packet");
-            transport.send([pending]).await?;
+            // Same bound as the run-loop sends: a relay that accepts the TCP
+            // connection but wedges on the first write must surface as a connect
+            // error (→ the caller's reconnect backoff), not hang `connect` forever.
+            match tokio::time::timeout(self.send_timeout, transport.send([pending])).await {
+                Ok(sent) => sent?,
+                Err(_elapsed) => {
+                    return Err(ts_derp::Error::IoFailure(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "pending-flush send timed out (write path wedged)",
+                    )));
+                }
+            }
         }
 
         Ok((transport, frames))
@@ -693,13 +709,13 @@ impl Runner {
                     rx_stall.on_send(from_net.1.len() as u64);
                     // Bound the send: a wedged relay TCP path must not starve the
                     // select loop (and with it the stall deadline + age recycle).
-                    match tokio::time::timeout(Self::SEND_TIMEOUT, transport.send([from_net])).await {
+                    match tokio::time::timeout(self.send_timeout, transport.send([from_net])).await {
                         Ok(sent) => sent?,
                         Err(_elapsed) => {
                             tracing::warn!(
                                 parent: &span,
                                 region_id = %self.region_id,
-                                timeout_secs = Self::SEND_TIMEOUT.as_secs(),
+                                timeout = ?self.send_timeout,
                                 "derp send timed out (write path wedged); recycling connection"
                             );
                             return Ok(());
@@ -1123,6 +1139,23 @@ mod tests {
         assert_ne!(jittered(base, 0), jittered(base, 100));
     }
 
+    #[test]
+    fn spawn_path_jitter_keeps_env_threshold_in_bounds() {
+        // The spawn path composes env parsing with per-node jitter
+        // (`RxStallConfig::from_env().with_jitter(seed)`); the effective tracker
+        // threshold must land in [T, 1.2T] of the configured value, and the
+        // kill-switch must stay off regardless of seed.
+        let base = secs(240);
+        for seed in [0u64, 7, 100, 12345, u64::MAX] {
+            let cfg = RxStallConfig::from_parts(Some("240")).with_jitter(seed);
+            let t = cfg.stall_threshold.expect("enabled");
+            assert!(t >= base, "never below the configured threshold ({seed})");
+            assert!(t <= base * 12 / 10, "at most +20% ({seed})");
+        }
+        let off = RxStallConfig::from_parts(Some("off")).with_jitter(42);
+        assert_eq!(off.stall_threshold, None, "kill-switch survives jitter");
+    }
+
     // ---- behavior harness: the cross-region one-way stall timeline ----
 
     #[test]
@@ -1341,6 +1374,7 @@ mod tests {
             rx_stall_config: RxStallConfig {
                 stall_threshold: Some(threshold),
             },
+            send_timeout: Runner::SEND_TIMEOUT,
             env,
         };
 
