@@ -10,7 +10,10 @@
 ;                   $ProgramData var, NOT the built-in PROGRAMDATA constant:
 ;                   nixpkgs NSIS lacks that constant — it warns + ignores, board gotcha)
 ;      non-admin -> %LOCALAPPDATA%\koidra-ssh
-;    Also detect an existing koidra-gateway dir (re-run / repair — idempotent).
+;    Re-run detection is CONTENT-based, not bare dir existence (C1/M4): a
+;    koidra-gateway dir with a NON-EMPTY primary.json is a genuine prior install
+;    -> "repair"; an absent/0-byte json means a half-failed fresh -> "fresh"
+;    (re-key), never a silent-no-op "repair" that locks the box out.
 ;
 ; 2. IDENTITY PRESERVATION: COPY primary.json + backup.json BYTE-IDENTICAL from
 ;    the OLD dir into the new dir. NEVER mint fresh identity on an upgrade. If the
@@ -27,9 +30,12 @@
 ;    <channel>, replicating the old console name exactly (Windows node name comes
 ;    from TS_HOSTNAME, not the json) so the console name never churns.
 ;
-; 5. STOP OLD BEFORE START NEW: stop-old-stack.ps1 ends the old KoidraSSH-* tasks,
-;    kills every ssh_shell* tree + the old supervise loops, and VERIFIES zero
-;    remain, BEFORE any new task is /run. Never two processes on one keyfile.
+; 5. STOP OLD BEFORE START NEW, PER-CHANNEL (H3): stop-old-stack.ps1 <oldDir>
+;    <isAdmin> <channel> ends that channel's old KoidraSSH-* task, kills its
+;    ssh_shell* + supervise loop, and VERIFIES zero remain, BEFORE that channel's
+;    new task is /run. SecStart swaps BACKUP fully, then PRIMARY — the two old
+;    channels are never both down at once (>=1 up throughout). Never two processes
+;    on one keyfile.
 ;
 ; 6. Both channels on port 22 (each channel is its own tailnet IP — no conflict).
 ;
@@ -48,10 +54,24 @@
 ;
 ; 10. No built-in PROGRAMDATA constant; no WriteEnvStr (no env writes at all).
 ;
+; 11. /REPROVISION (operator escape hatch, C1): on a net-new/lab box whose fresh
+;     install half-failed (bad key + unregistered/0-byte json), force the
+;     fresh-provision path — overwrite authkey.txt from the operator key, wipe
+;     ONLY 0-byte/unregistered jsons (NEVER a non-empty registered one), rewrite
+;     the launcher. Without it, a bad key would be silently kept and run 2 no-ops.
+;
+; 12. /CONSOLE + over-SSH guard (H3): the UPGRADE path stops the old stack, which
+;     over the box's OWN koidra SSH channel would kill the transport mid-run and
+;     brick the box. check-console.ps1 refuses to run when launched under an
+;     ssh_shell* ancestor (best-effort); /CONSOLE bypasses if the operator is
+;     certain it is a console session. Fresh/repair/reprovision are NOT guarded
+;     (they never stop an old stack, so an over-SSH lab install is safe).
+;
 ; Build:  makensis -DGW_SHA=<sha> installer.nsi
 ;   Stage beside this .nsi: koidra_gateway.exe (raw Cargo example output),
 ;   run-node2.cmd, supervisor.vbs, start-{primary,backup}.vbs,
-;   start-{primary,backup}-old.vbs, extract-authkey.ps1, stop-old-stack.ps1.
+;   start-{primary,backup}-old.vbs, extract-authkey.ps1, stop-old-stack.ps1,
+;   check-console.ps1.
 ;   For a FRESH (net-new / lab) box, also stage primary.json/backup.json and/or
 ;   authkey.txt beside the .nsi, or set KOIDRA_PRIMARY_AUTHKEY in the environment.
 ; =============================================================================
@@ -88,11 +108,14 @@ VIAddVersionKey "ProductVersion" "0.4.0.254"
 
 Var IsAdmin       ; "1" if the current token is elevated
 Var Finalize      ; "1" if launched with /FINALIZE (persistence-removal pass only)
+Var Reprovision   ; "1" if launched with /REPROVISION (operator escape hatch: force
+                  ;     fresh-provision on an existing net-new/lab koidra-gateway dir)
+Var ConsoleAck    ; "1" if launched with /CONSOLE (bypass the best-effort over-SSH guard)
 Var ProgramData   ; %PROGRAMDATA%   (via ReadEnvStr)
 Var LocalAppDir   ; %LOCALAPPDATA%  (via ReadEnvStr)
 Var BaseDir       ; ProgramData (admin) or LocalAppData (non-admin)
 Var OldDir        ; <BaseDir>\koidra-ssh
-Var Mode          ; "upgrade" | "fresh" | "repair"
+Var Mode          ; "upgrade" | "fresh" | "repair" | "reprovision"
 
 ; Directory is COMPUTED from the detected layout — never operator-chosen (a wrong
 ; dir loses identity). So no MUI_PAGE_DIRECTORY / COMPONENTS.
@@ -104,14 +127,36 @@ Var Mode          ; "upgrade" | "fresh" | "repair"
 ; --------------------------------------------------------------------------- ;
 Function .onInit
     StrCpy $Finalize 0
+    StrCpy $Reprovision 0
+    StrCpy $ConsoleAck 0
+
+    ${GetParameters} $R0
 
     ; /FINALIZE — persistence-removal pass only (§7). No install, no identity, no
     ; new tasks; just remove the OLD persistence after external validation.
-    ${GetParameters} $R0
     ClearErrors
     ${GetOptions} $R0 "/FINALIZE" $R1
     ${IfNot} ${Errors}
         StrCpy $Finalize 1
+    ${EndIf}
+
+    ; /REPROVISION — operator escape hatch (§11). Forces the fresh-provision path
+    ; on an existing net-new/lab koidra-gateway dir: re-key from the operator's key
+    ; and wipe any 0-byte/unregistered json so the binary re-inits. Ignored when an
+    ; old koidra-ssh dir is present (that is an identity-preserving UPGRADE).
+    ClearErrors
+    ${GetOptions} $R0 "/REPROVISION" $R1
+    ${IfNot} ${Errors}
+        StrCpy $Reprovision 1
+    ${EndIf}
+
+    ; /CONSOLE — assert this run is at the physical/RDP console, bypassing the
+    ; best-effort over-SSH guard (§12) in case its parent-process detection
+    ; false-positives. Use ONLY when you are truly at the console.
+    ClearErrors
+    ${GetOptions} $R0 "/CONSOLE" $R1
+    ${IfNot} ${Errors}
+        StrCpy $ConsoleAck 1
     ${EndIf}
 
     ; Elevation.
@@ -153,10 +198,36 @@ Function .onInit
             StrCpy $BaseDir $LocalAppDir
         ${EndIf}
         StrCpy $Mode "fresh"
-        ; Existing koidra-gateway dir with no koidra-ssh -> repair/re-run.
-        ${If} ${FileExists} "$BaseDir\koidra-gateway\*.*"
-            StrCpy $Mode "repair"
+
+        ; ---- C1/M4: CONTENT-based re-run detection (NOT bare dir existence) --- ;
+        ; A half-failed FRESH install can leave a koidra-gateway dir + a bad
+        ; authkey.txt + a self-created UNREGISTERED / 0-byte json. Bare dir
+        ; existence -> "repair" would then silently preserve those artifacts and
+        ; no-op run 2, locking the box out (the confirmed field incident).
+        ;
+        ; A GENUINE prior install has a NON-EMPTY primary.json (the binary writes
+        ; real state once it registers). So:
+        ;   * /REPROVISION            -> force fresh-provision (re-key, wipe stubs)
+        ;   * non-empty primary.json  -> genuine prior state -> "repair"
+        ;   * absent / 0-byte json    -> NEVER-provisioned  -> "fresh" (re-key)
+        ${If} $Reprovision == 1
+            StrCpy $Mode "reprovision"
+        ${ElseIf} ${FileExists} "$BaseDir\koidra-gateway\primary.json"
+            ClearErrors
+            FileOpen $4 "$BaseDir\koidra-gateway\primary.json" r
+            ${IfNot} ${Errors}
+                FileSeek $4 0 END $5      ; $5 = file size in bytes
+                FileClose $4
+                ${If} $5 > 0
+                    StrCpy $Mode "repair"     ; registered identity present
+                ${Else}
+                    StrCpy $Mode "fresh"      ; 0-byte stub -> never provisioned
+                ${EndIf}
+            ${Else}
+                StrCpy $Mode "fresh"          ; unreadable -> treat as never provisioned
+            ${EndIf}
         ${EndIf}
+        ; (a koidra-gateway dir with NO primary.json at all stays "fresh")
     ${EndIf}
 
     StrCpy $OldDir  "$BaseDir\koidra-ssh"
@@ -189,6 +260,45 @@ Function DoFinalize
 FunctionEnd
 
 ; --------------------------------------------------------------------------- ;
+; REPROVISION helpers (C1): delete an INSTDIR json ONLY when it is 0-byte (an
+; unregistered stub) so the binary re-inits. A NON-empty json is a registered
+; identity and is NEVER touched. Two near-identical fns because NSIS Function
+; params via the stack are noisier than this for a two-call site.
+Function WipeStubJson_Primary
+    ${If} ${FileExists} "$INSTDIR\primary.json"
+        ClearErrors
+        FileOpen $6 "$INSTDIR\primary.json" r
+        ${IfNot} ${Errors}
+            FileSeek $6 0 END $7
+            FileClose $6
+            ${If} $7 <= 0
+                Delete "$INSTDIR\primary.json"
+                DetailPrint "REPROVISION: deleted 0-byte primary.json (unregistered stub) so the binary re-inits."
+            ${Else}
+                DetailPrint "REPROVISION: kept NON-empty primary.json ($7 bytes) — registered identity preserved."
+            ${EndIf}
+        ${EndIf}
+    ${EndIf}
+FunctionEnd
+
+Function WipeStubJson_Backup
+    ${If} ${FileExists} "$INSTDIR\backup.json"
+        ClearErrors
+        FileOpen $6 "$INSTDIR\backup.json" r
+        ${IfNot} ${Errors}
+            FileSeek $6 0 END $7
+            FileClose $6
+            ${If} $7 <= 0
+                Delete "$INSTDIR\backup.json"
+                DetailPrint "REPROVISION: deleted 0-byte backup.json (unregistered stub) so the binary re-inits."
+            ${Else}
+                DetailPrint "REPROVISION: kept NON-empty backup.json ($7 bytes) — registered identity preserved."
+            ${EndIf}
+        ${EndIf}
+    ${EndIf}
+FunctionEnd
+
+; --------------------------------------------------------------------------- ;
 Section "Koidra Gateway (required)" SecCore
     SectionIn RO
     DetailPrint "Mode: $Mode   Layout base: $BaseDir   Elevated: $IsAdmin"
@@ -204,11 +314,39 @@ Section "Koidra Gateway (required)" SecCore
     File "start-backup-old.vbs"
     File "extract-authkey.ps1"
     File "stop-old-stack.ps1"
+    File "check-console.ps1"
     File /oname=${BIN_VERSIONED} "${BIN_SRC}"
 
-    ; Seed the version pointer with the versioned binary name (never a bare
-    ; unversioned name). The launcher reads this first.
+    ; ---- OVER-SSH GUARD (§12, H3b) — upgrade only ------------------------ ;
+    ; Only the UPGRADE path stops a live old stack (stop-old-stack), so only it
+    ; can kill the box's own koidra SSH transport mid-run and brick it. Best-effort
+    ; parent-process check: refuse if launched under an ssh_shell* ancestor unless
+    ; the operator asserted /CONSOLE. (Fresh/repair/reprovision never stop an old
+    ; stack, so a lab install driven over SSH is safe and NOT guarded.) The abort
+    ; here happens BEFORE any stop, so a false-positive costs nothing.
+    ${If} $Mode == "upgrade"
+    ${AndIf} $ConsoleAck != 1
+        nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\check-console.ps1"'
+        Pop $0
+        ${If} $0 != 0
+            MessageBox MB_OK|MB_ICONSTOP "CONSOLE-ONLY ABORT: this installer appears to be running over the box's own koidra SSH channel (an ssh_shell* ancestor was detected). The upgrade stops the old stack, which would kill this transport mid-run and brick the box (no reboot allowed).$\n$\nRun it AT THE CONSOLE (physical / RDP). If you are certain this is a console session and the detection is wrong, re-run with /CONSOLE."
+            Abort
+        ${EndIf}
+        DetailPrint "Console guard: no ssh_shell* ancestor detected (not an over-SSH run)."
+    ${EndIf}
+
+    ; Seed the AUTHORITATIVE version pointer with the versioned binary name (never
+    ; a bare unversioned name). The launcher reads this first; the in-process
+    ; updater rewrites it (temp+rename).
     FileOpen $0 "$INSTDIR\current-koidra-gateway.txt" w
+    FileWrite $0 "${BIN_VERSIONED}"
+    FileClose $0
+
+    ; M2: bake the DEFAULT pointer from GW_SHA (the sha this installer actually
+    ; bundled). The updater NEVER rewrites this file, so it survives an emptied /
+    ; half-written current pointer and keeps the launcher off the hardcoded literal
+    ; fallback — the fallback is now a true last resort (both pointers missing).
+    FileOpen $0 "$INSTDIR\default-koidra-gateway.txt" w
     FileWrite $0 "${BIN_VERSIONED}"
     FileClose $0
 
@@ -227,10 +365,57 @@ Section "Koidra Gateway (required)" SecCore
             MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\backup.json is missing. Refusing to mint a fresh node identity."
             Abort
         ${EndIf}
+        ; M1: existence is NOT enough — a 0-byte / truncated old json passes
+        ; FileExists and would be copied byte-identical, reproducing the
+        ; EOF-while-parsing crash-loop on the new layout. A 0-byte identity file
+        ; means the box was ALREADY broken; refuse rather than propagate.
+        ClearErrors
+        FileOpen $6 "$OldDir\primary.json" r
+        ${IfNot} ${Errors}
+            FileSeek $6 0 END $7
+            FileClose $6
+        ${Else}
+            StrCpy $7 0
+        ${EndIf}
+        ${If} $7 <= 0
+            MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\primary.json is 0-byte / unreadable (a corrupt identity file). The box is already broken; refusing to copy it onto the new layout. Investigate + restore a good json before proceeding."
+            Abort
+        ${EndIf}
+        ClearErrors
+        FileOpen $6 "$OldDir\backup.json" r
+        ${IfNot} ${Errors}
+            FileSeek $6 0 END $7
+            FileClose $6
+        ${Else}
+            StrCpy $7 0
+        ${EndIf}
+        ${If} $7 <= 0
+            MessageBox MB_OK|MB_ICONSTOP "UPGRADE ABORT: $OldDir\backup.json is 0-byte / unreadable (a corrupt identity file). Refusing to propagate a broken identity onto the new layout."
+            Abort
+        ${EndIf}
         ; Byte-identical copy -> same nodeId + same 100.x IP.
         CopyFiles /SILENT "$OldDir\primary.json" "$INSTDIR\primary.json"
         CopyFiles /SILENT "$OldDir\backup.json"  "$INSTDIR\backup.json"
-        DetailPrint "Identity: copied primary.json + backup.json from $OldDir (byte-identical)."
+        DetailPrint "Identity: copied primary.json + backup.json from $OldDir (byte-identical, non-empty)."
+    ${ElseIf} $Mode == "reprovision"
+        ; C1 escape hatch: wipe ONLY 0-byte / unregistered stubs so the binary
+        ; re-inits on first launch. NEVER delete a NON-empty (registered) json —
+        ; that would destroy a real identity (100.x IP + node/machine keys).
+        Call WipeStubJson_Primary
+        Call WipeStubJson_Backup
+        ; After wiping stubs, stage operator identity if present; otherwise the
+        ; binary registers on first launch with the (re-keyed) auth key.
+        ${IfNot} ${FileExists} "$INSTDIR\primary.json"
+            ${If} ${FileExists} "$EXEDIR\primary.json"
+                CopyFiles /SILENT "$EXEDIR\primary.json" "$INSTDIR\primary.json"
+            ${EndIf}
+        ${EndIf}
+        ${IfNot} ${FileExists} "$INSTDIR\backup.json"
+            ${If} ${FileExists} "$EXEDIR\backup.json"
+                CopyFiles /SILENT "$EXEDIR\backup.json" "$INSTDIR\backup.json"
+            ${EndIf}
+        ${EndIf}
+        DetailPrint "Identity: REPROVISION — wiped 0-byte stubs (registered jsons preserved); binary re-inits if none."
     ${ElseIf} $Mode == "repair"
         ; Keep the already-present new jsons; only re-stage if genuinely absent.
         ${IfNot} ${FileExists} "$INSTDIR\primary.json"
@@ -277,66 +462,152 @@ Section "Koidra Gateway (required)" SecCore
             Abort
         ${EndIf}
         DetailPrint "Auth key: extracted baked token from $OldDir -> authkey.txt."
+    ${ElseIf} $Mode == "reprovision"
+        ; C1 escape hatch: ALWAYS overwrite authkey.txt from the operator's key
+        ; (the whole point — the lockout was a bad key being kept). Prefer a staged
+        ; file, else KOIDRA_PRIMARY_AUTHKEY.
+        ${If} ${FileExists} "$EXEDIR\authkey.txt"
+            CopyFiles /SILENT "$EXEDIR\authkey.txt" "$INSTDIR\authkey.txt"
+        ${Else}
+            ReadEnvStr $2 "KOIDRA_PRIMARY_AUTHKEY"
+            ${If} $2 == ""
+                MessageBox MB_OK|MB_ICONSTOP "REPROVISION ABORT: no auth key supplied. Stage authkey.txt beside the installer or set KOIDRA_PRIMARY_AUTHKEY before re-running with /REPROVISION."
+                Abort
+            ${EndIf}
+            FileOpen $3 "$INSTDIR\authkey.txt" w
+            FileWrite $3 "$2"
+            FileClose $3
+        ${EndIf}
+        DetailPrint "Auth key: REPROVISION overwrote authkey.txt from the operator key."
     ${Else}
         ; FRESH / REPAIR — bake the operator-supplied key TO DISK at install time
         ; (reading env NOW to write a file is fine; only LAUNCH-time env is banned).
-        ${IfNot} ${FileExists} "$INSTDIR\authkey.txt"
+        ; C1: an EMPTY authkey.txt is treated as ABSENT (a half-failed prior run can
+        ; leave a 0-byte key). Only a NON-empty existing key is preserved as-is.
+        StrCpy $6 0    ; $6 = 1 when a usable (non-empty) key is already present
+        ${If} ${FileExists} "$INSTDIR\authkey.txt"
+            ClearErrors
+            FileOpen $4 "$INSTDIR\authkey.txt" r
+            ${IfNot} ${Errors}
+                FileSeek $4 0 END $5
+                FileClose $4
+                ${If} $5 > 0
+                    StrCpy $6 1
+                ${EndIf}
+            ${EndIf}
+        ${EndIf}
+        ${If} $6 == 0
             ${If} ${FileExists} "$EXEDIR\authkey.txt"
                 CopyFiles /SILENT "$EXEDIR\authkey.txt" "$INSTDIR\authkey.txt"
             ${Else}
                 ReadEnvStr $2 "KOIDRA_PRIMARY_AUTHKEY"
                 ${If} $2 == ""
-                    MessageBox MB_OK|MB_ICONSTOP "ABORT: no auth key for a fresh install. Stage authkey.txt beside the installer or set KOIDRA_PRIMARY_AUTHKEY before running."
+                    MessageBox MB_OK|MB_ICONSTOP "ABORT: no auth key for a fresh install (existing authkey.txt is absent or empty). Stage authkey.txt beside the installer or set KOIDRA_PRIMARY_AUTHKEY before running."
                     Abort
                 ${EndIf}
                 FileOpen $3 "$INSTDIR\authkey.txt" w
                 FileWrite $3 "$2"
                 FileClose $3
             ${EndIf}
+            DetailPrint "Auth key: (re)baked to authkey.txt (fresh/repair; prior key absent or empty)."
+        ${Else}
+            DetailPrint "Auth key: kept existing non-empty authkey.txt (fresh/repair)."
         ${EndIf}
-        DetailPrint "Auth key: baked to authkey.txt (fresh/repair)."
     ${EndIf}
 
-    ; ---- STOP OLD STACK (§5) — upgrade only, BEFORE any new task /run ----- ;
-    ${If} $Mode == "upgrade"
-        DetailPrint "Stopping old koidra-ssh stack and verifying zero ssh_shell* remain..."
-        nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\stop-old-stack.ps1" "$OldDir" "$IsAdmin"'
-        Pop $0
-        ${If} $0 != 0
-            MessageBox MB_OK|MB_ICONSTOP "ABORT: old ssh_shell processes are still running after the stop attempt (exit $0). Refusing to start the new stack over a live old one (two processes on one keyfile = orphan node). Resolve manually, then re-run."
-            Abort
-        ${EndIf}
-        DetailPrint "Old stack confirmed down."
-    ${EndIf}
+    ; NOTE (§5, H3): stopping the old stack is NO LONGER done here as a both-channel
+    ; step. It is sequenced PER-CHANNEL in SecStart (backup fully stopped+started,
+    ; then primary) so both channels are never simultaneously down during an
+    ; upgrade. Staging above is non-destructive (copies into the NEW dir beside the
+    ; old), so the old stack stays fully up until each channel's swap in SecStart.
 
     WriteUninstaller "$INSTDIR\uninstall-koidra-gateway.exe"
 SectionEnd
 
 ; --------------------------------------------------------------------------- ;
+; H3: on UPGRADE, swap PER-CHANNEL (backup fully, then primary) so the two old
+; channels are never both down at once — >=1 channel is up at every instant.
+; stop-old-stack.ps1 takes a channel arg and only stops/verifies that channel.
+; On FRESH/REPAIR/REPROVISION there is no old stack, so both channels start
+; together.
 Section "Start koidra-gateway channels" SecStart
     ${If} $IsAdmin == 1
         ; SYSTEM tasks, onstart, HIGHEST. Both channels on port 22 (§6).
-        ; /tr has NO nested quotes (board gotcha): ProgramData path has no spaces,
-        ; so the whole `cmd /c <path> <chan> 22` is a single outer-quoted value.
+        ; run-node2.cmd self-loops (H1), so the foreground `cmd /c` task recovers
+        ; from a binary exit without a reboot. /tr has NO nested quotes (board
+        ; gotcha): ProgramData path has no spaces, so the whole `cmd /c <path>
+        ; <chan> 22` is a single outer-quoted value.
         nsExec::ExecToLog 'schtasks /create /tn "KoidraGateway-primary" /ru SYSTEM /sc onstart /rl HIGHEST /tr "cmd /c $INSTDIR\run-node2.cmd primary 22" /f'
         Pop $0
         nsExec::ExecToLog 'schtasks /create /tn "KoidraGateway-backup" /ru SYSTEM /sc onstart /rl HIGHEST /tr "cmd /c $INSTDIR\run-node2.cmd backup 22" /f'
         Pop $0
-        ; Start now (detached by construction — SYSTEM tasks are not session children).
-        nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-primary"'
-        Pop $0
-        nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-backup"'
-        Pop $0
-        DetailPrint "Admin: KoidraGateway-primary/-backup created (onstart) and started."
+
+        ${If} $Mode == "upgrade"
+            ; --- BACKUP channel: stop old backup, then start new backup --------
+            DetailPrint "Upgrade: stopping OLD backup channel (primary still serving)..."
+            nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\stop-old-stack.ps1" "$OldDir" "$IsAdmin" backup'
+            Pop $0
+            ${If} $0 != 0
+                MessageBox MB_OK|MB_ICONSTOP "ABORT: old BACKUP ssh_shell processes still running after the stop attempt (exit $0). Refusing to start the new backup over a live old one (two processes on one keyfile = orphan node). Old PRIMARY was NOT touched — the box is still reachable. Resolve at console, then re-run."
+                Abort
+            ${EndIf}
+            nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-backup"'
+            Pop $0
+            DetailPrint "Admin: new BACKUP started; OLD primary still up (>=1 channel up)."
+
+            ; --- PRIMARY channel: stop old primary, then start new primary -----
+            DetailPrint "Upgrade: stopping OLD primary channel (new backup now serving)..."
+            nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\stop-old-stack.ps1" "$OldDir" "$IsAdmin" primary'
+            Pop $0
+            ${If} $0 != 0
+                MessageBox MB_OK|MB_ICONSTOP "ABORT: old PRIMARY ssh_shell processes still running after the stop attempt (exit $0). New BACKUP is up (box reachable); refusing to start the new primary over a live old one. Resolve at console, then re-run."
+                Abort
+            ${EndIf}
+            nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-primary"'
+            Pop $0
+            DetailPrint "Admin: new PRIMARY started; both channels now on koidra-gateway."
+        ${Else}
+            ; Fresh / repair / reprovision — no old stack; start both.
+            nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-backup"'
+            Pop $0
+            nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-primary"'
+            Pop $0
+            DetailPrint "Admin: KoidraGateway-primary/-backup created (onstart) and started."
+        ${EndIf}
     ${Else}
-        ; Non-admin: ONE Startup shortcut -> ONE supervisor that launches BOTH
-        ; channel loops (symmetric bring-up, no per-channel onlogon task, no
-        ; primary double-launch). Matches the old KoidraSSH.lnk contract.
+        ; Non-admin: ONE Startup shortcut -> supervisor.vbs (MASTER) which spawns
+        ; BOTH self-looping run-node2.cmd channels at boot (symmetric bring-up, no
+        ; per-channel onlogon task, no primary double-launch). Matches the old
+        ; KoidraSSH.lnk contract.
         CreateShortcut "$SMSTARTUP\KoidraGateway.lnk" "$SYSDIR\wscript.exe" '"$INSTDIR\supervisor.vbs"' "$INSTDIR\${BIN_VERSIONED}" 0
-        ; Start the supervisor NOW, detached (Exec does not wait — the supervisor
-        ; loops forever). It spawns start-primary.vbs + start-backup.vbs.
-        Exec '"$SYSDIR\wscript.exe" "$INSTDIR\supervisor.vbs"'
-        DetailPrint "Non-admin: KoidraGateway.lnk created and supervisor started (both channels)."
+
+        ${If} $Mode == "upgrade"
+            ; Per-channel swap for THIS run (boot persistence via the .lnk above).
+            ; start-<chan>.vbs detaches a self-looping run-node2.cmd (SSH-safe).
+            DetailPrint "Upgrade: stopping OLD backup channel (primary still serving)..."
+            nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\stop-old-stack.ps1" "$OldDir" "$IsAdmin" backup'
+            Pop $0
+            ${If} $0 != 0
+                MessageBox MB_OK|MB_ICONSTOP "ABORT: old BACKUP loop/processes still running after the stop attempt (exit $0). Old PRIMARY was NOT touched (box reachable). Resolve at console, then re-run."
+                Abort
+            ${EndIf}
+            Exec '"$SYSDIR\wscript.exe" "$INSTDIR\start-backup.vbs"'
+            DetailPrint "Non-admin: new BACKUP started detached; OLD primary still up."
+
+            DetailPrint "Upgrade: stopping OLD primary channel (new backup now serving)..."
+            nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\stop-old-stack.ps1" "$OldDir" "$IsAdmin" primary'
+            Pop $0
+            ${If} $0 != 0
+                MessageBox MB_OK|MB_ICONSTOP "ABORT: old PRIMARY loop/processes still running after the stop attempt (exit $0). New BACKUP is up (box reachable). Resolve at console, then re-run."
+                Abort
+            ${EndIf}
+            Exec '"$SYSDIR\wscript.exe" "$INSTDIR\start-primary.vbs"'
+            DetailPrint "Non-admin: new PRIMARY started detached; both channels now on koidra-gateway."
+        ${Else}
+            ; Fresh / repair / reprovision — no old stack; master spawns both.
+            Exec '"$SYSDIR\wscript.exe" "$INSTDIR\supervisor.vbs"'
+            DetailPrint "Non-admin: KoidraGateway.lnk created and supervisor started (both channels)."
+        ${EndIf}
     ${EndIf}
 SectionEnd
 
@@ -360,9 +631,12 @@ Section "Uninstall"
     Delete "$INSTDIR\start-backup-old.vbs"
     Delete "$INSTDIR\extract-authkey.ps1"
     Delete "$INSTDIR\stop-old-stack.ps1"
+    Delete "$INSTDIR\check-console.ps1"
     Delete "$INSTDIR\current-koidra-gateway.txt"
+    Delete "$INSTDIR\default-koidra-gateway.txt"
     Delete "$INSTDIR\old-install-dir.txt"
     Delete "$INSTDIR\authkey.txt"
+    Delete "$INSTDIR\koidra-diag.txt"
     Delete "$INSTDIR\primary.json"
     Delete "$INSTDIR\backup.json"
     Delete "$INSTDIR\uninstall-koidra-gateway.exe"

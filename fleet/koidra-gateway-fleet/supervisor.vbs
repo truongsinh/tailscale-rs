@@ -1,75 +1,55 @@
-' supervisor.vbs — koidra-gateway non-admin boot supervisor (Windows).
+' supervisor.vbs - koidra-gateway non-admin boot launcher (Windows).
 '
 ' Used on boxes that can't host SYSTEM scheduled tasks (non-admin install under
 ' %LOCALAPPDATA%\koidra-gateway\). The Startup group launches this via
 ' KoidraGateway.lnk.
 '
+' PURE LAUNCHER - it does NOT own a relaunch loop (H1 fix). run-node2.cmd is now
+' the SINGLE loop owner (crash-relaunch + fast-exit backoff live there), so BOTH
+' the admin and non-admin layouts recover from a process exit the same way and
+' there is exactly ONE loop per channel (no double-loop). This file only SPAWNS
+' the loop(s) detached, then exits.
+'
 ' TWO MODES in one file:
 '
-'   * MASTER (no args): spawns ONE detached per-channel relaunch loop for BOTH
-'     channels (primary + backup), each on port 22, then exits. Because each
-'     channel loop is its OWN detached wscript process, a crash-loop of one
-'     channel can NEVER take the other down — no shared fate. This restores the
-'     old KoidraSSH.lnk "one supervisor brings up BOTH channels" contract while
-'     keeping the two loops independent.
+'   * MASTER (no args): spawns ONE detached `cmd /c run-node2.cmd <chan> 22` per
+'     channel (primary + backup), once each, then exits. Each run-node2.cmd is its
+'     OWN detached process running its OWN loop, so a crash-loop of one channel can
+'     NEVER take the other down (no shared fate). This restores the old
+'     KoidraSSH.lnk "one supervisor brings up BOTH channels" contract.
 '
-'   * LOOP (<channel> <port>): the per-channel relaunch loop. Runs
-'     run-node2.cmd, waits for it to exit, relaunches. Fast-exit backoff: if the
-'     child dies in < HEALTHY_SECS it is treated as an immediate crash and the
-'     relaunch delay backs off progressively (up to MAX_DELAY_MS) instead of
-'     tight-spinning invisibly behind a live-looking process tree. A child that
-'     survives HEALTHY_SECS resets the backoff to the base delay.
+'   * SINGLE (<channel> <port>): spawns ONE detached `cmd /c run-node2.cmd
+'     <channel> <port>` and exits. A thin per-channel launch entry point (used by
+'     start-*.vbs / rollback fallbacks) - still NO loop here; run-node2.cmd loops.
 '
-' Ports: BOTH channels on 22 (each channel is its own tailnet IP — no conflict).
+' Ports: BOTH channels on 22 (each channel is its own tailnet IP - no conflict).
 
 Option Explicit
 
-Const HEALTHY_SECS  = 20      ' child must survive this long to count as "up"
-Const BASE_DELAY_MS = 5000    ' normal relaunch delay
-Const MAX_DELAY_MS  = 60000   ' cap for the fast-exit backoff
-
-Dim WshShell, fso, scriptDir, sysDir, wscriptExe
+Dim WshShell, fso, scriptDir
 Set WshShell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
-sysDir = fso.GetSpecialFolder(1)                       ' 1 = System32
-wscriptExe = """" & fso.BuildPath(sysDir, "wscript.exe") & """"
 
-' ---- MASTER mode: spawn both per-channel loops detached, then exit --------- '
+' ---- MASTER mode: spawn both channel loops detached, then exit ------------- '
 If WScript.Arguments.Count = 0 Then
-    Dim selfPath
-    selfPath = """" & WScript.ScriptFullName & """"
-    ' 0 = hidden window; False = do NOT wait — each loop is an independent process.
-    WshShell.Run wscriptExe & " " & selfPath & " primary 22", 0, False
-    WshShell.Run wscriptExe & " " & selfPath & " backup 22", 0, False
+    ' 0 = hidden window; False = do NOT wait - each run-node2.cmd is an
+    ' independent, self-looping process.
+    WshShell.Run "cmd /c """ & scriptDir & "\run-node2.cmd"" primary 22", 0, False
+    WshShell.Run "cmd /c """ & scriptDir & "\run-node2.cmd"" backup 22", 0, False
     WScript.Quit 0
 End If
 
 If WScript.Arguments.Count < 2 Then
-    WScript.StdErr.WriteLine "usage: supervisor.vbs                 (master; spawns BOTH channels)"
-    WScript.StdErr.WriteLine "   or: supervisor.vbs <channel> <port>  (single-channel relaunch loop)"
+    WScript.StdErr.WriteLine "usage: supervisor.vbs                  (master; spawns BOTH channel loops)"
+    WScript.StdErr.WriteLine "   or: supervisor.vbs <channel> <port>  (spawns ONE channel loop detached)"
     WScript.Quit 2
 End If
 
-' ---- LOOP mode: one channel, relaunch with fast-exit backoff --------------- '
-Dim channel, port, cmd, startT, elapsed, fastFails, delayMs
+' ---- SINGLE mode: spawn one channel loop detached, then exit --------------- '
+Dim channel, port
 channel = WScript.Arguments(0)
 port    = WScript.Arguments(1)
-cmd = "cmd /c """ & scriptDir & "\run-node2.cmd"" " & channel & " " & port
-
-fastFails = 0
-Do While True
-    startT = Now
-    ' 0 = hidden; True = wait for the child to exit before relaunching.
-    WshShell.Run cmd, 0, True
-    elapsed = DateDiff("s", startT, Now)
-    If elapsed < HEALTHY_SECS Then
-        fastFails = fastFails + 1
-        delayMs = BASE_DELAY_MS * fastFails
-        If delayMs > MAX_DELAY_MS Then delayMs = MAX_DELAY_MS
-    Else
-        fastFails = 0
-        delayMs = BASE_DELAY_MS
-    End If
-    WScript.Sleep delayMs
-Loop
+' 0 = hidden; False = do NOT wait - run-node2.cmd owns the loop.
+WshShell.Run "cmd /c """ & scriptDir & "\run-node2.cmd"" " & channel & " " & port, 0, False
+WScript.Quit 0

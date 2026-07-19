@@ -15,9 +15,11 @@
 #   1. exe-override arg ($3)
 #   2. current-koidra-gateway.txt — the authoritative pointer (versioned name,
 #      no .exe on Linux), seeded on deploy and rewritten by the updater
-#   3. default fallback = the shipped VERSIONED name (never a bare/self-heal
-#      name — keeps the running build obvious and rollback identity intact).
-#      Kept in sync with the installer's GW_SHA default / branch HEAD.
+#   3. default-koidra-gateway.txt — the deploy-baked default (from GW_SHA); the
+#      updater NEVER rewrites this, so it survives an emptied/half-written current
+#      pointer and always names the sha that was actually deployed
+#   4. hardcoded literal fallback — last resort ONLY if both pointer files are
+#      missing (kept in sync with the installer's GW_SHA default).
 #
 # Identity file is node-<channel>.json in this dir (dev keyfiles are
 # node-primary.json / node-backup.json — NOT <channel>.json).
@@ -33,12 +35,19 @@ channel="${1:?usage: run.sh <channel> <port> [exe-override]}"
 port="${2:?usage: run.sh <channel> <port> [exe-override]}"
 override="${3:-}"
 
-# Default = shipped versioned binary (matches installer GW_SHA default / HEAD).
+# Hardcoded literal fallback (last resort; matches installer GW_SHA default).
 exe="$dir/koidra-gateway-06f9a3a"
+# Deploy-baked default pointer (from GW_SHA; the updater never rewrites it).
+if [[ -f "$dir/default-koidra-gateway.txt" ]]; then
+    default="$(head -n1 "$dir/default-koidra-gateway.txt" 2>/dev/null || true)"
+    [[ -n "$default" ]] && exe="$dir/$default"
+fi
+# Authoritative current pointer (updater rewrites this atomically) wins over default.
 if [[ -f "$dir/current-koidra-gateway.txt" ]]; then
     target="$(head -n1 "$dir/current-koidra-gateway.txt" 2>/dev/null || true)"
     [[ -n "$target" ]] && exe="$dir/$target"
 fi
+# Explicit override arg wins over everything.
 [[ -n "$override" ]] && exe="$dir/$override"
 
 # Dev keyfiles are node-<channel>.json, not <channel>.json.
