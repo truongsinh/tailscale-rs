@@ -29,12 +29,18 @@
 //! ## rx-stall escalation
 //!
 //! The watchdog also subscribes to [`RxStallEvent`] — published by the home region's
-//! derp task when its connection is one-way-dead (tx advancing, rx silent past
-//! `TS_OFFNET_RX_STALL_SECS`). Repeated stalls walk an escalation ladder:
+//! derp task when its connection is frame-silent (zero DERP frames, server keepalives
+//! included, past `TS_OFFNET_RX_STALL_SECS`); the detecting connection recycles itself
+//! locally immediately after publishing. Repeated stalls walk an escalation ladder:
 //! re-netcheck ([`Remeasure`]) → forced lateral re-home overriding anti-flap
-//! hysteresis ([`ForceRehome`]) → full control reconnect + re-home
-//! ([`ForceReconnect`] + [`ForceRehome`]). Every action is in-process and preserves
-//! established SSH sessions.
+//! hysteresis and penalty-boxing the stalled region ([`ForceRehome`]) → full control
+//! reconnect + re-home ([`ForceReconnect`] + [`ForceRehome`]). Every action is
+//! in-process and preserves established SSH sessions.
+//!
+//! Ladder hygiene: the stall history is per-region — a fresh home region never
+//! inherits the previous region's strikes — and repeated `FullReset`s without recovery
+//! back off exponentially (up to 30 min) instead of churning control registration
+//! every few minutes on a box whose only reachable relay is dead.
 //!
 //! ## Hysteresis
 //!
@@ -53,13 +59,14 @@ use kameo::{
     actor::ActorRef,
     message::{Context, Message},
 };
+use ts_derp::RegionId;
 
 use crate::{
     Error,
     control_runner::ForceReconnect,
     derp_latency::{DerpLatencyMeasurer, ForceRehome, Remeasure},
     env::Env,
-    multiderp::RxStallEvent,
+    multiderp::{RxStallConfig, RxStallEvent, jitter_seed, jittered},
 };
 
 /// Poll interval for the watchdog tick.
@@ -75,6 +82,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// spurious control reconnect during a handover is churn we don't want on customer
 /// boxes. 180s clears the worst observed normal dip with margin.
 const DEFAULT_T_DETECT: Duration = Duration::from_secs(180);
+
+/// Floor for the env-tunable `T_DETECT`: below two poll intervals, a single missed
+/// poll could trigger a false fire on the next one.
+const MIN_T_DETECT: Duration = Duration::from_secs(60);
 
 /// Cooldown after a forced reconnect before another may fire.
 ///
@@ -92,7 +103,17 @@ const T_DETECT_ENV: &str = "TS_OFFNET_T_DETECT_SECS";
 /// Sized so consecutive stalls of one dead relay stay in-window: with the default
 /// 180s stall threshold, stall #2 lands ~3–6 min after #1 and stall #3 ~6–10 min in;
 /// 15 minutes comfortably holds the whole ladder while ageing out isolated one-offs.
+/// Isolated stalls also age out naturally, which doubles as the "sustained recovery"
+/// decay: a stall-free window resets the ladder to its bottom rung.
 const DEFAULT_STALL_ESCALATION_WINDOW: Duration = Duration::from_secs(900);
+
+/// Cap for the env-tunable stall window: anything above a day retains strikes so long
+/// that unrelated stalls days apart would compound.
+const MAX_STALL_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Hard cap on retained stall instants (memory bound; an env-widened window must not
+/// let the history grow without limit).
+const STALL_HISTORY_CAP: usize = 64;
 
 /// Environment variable override for the stall escalation window (in seconds).
 const STALL_WINDOW_ENV: &str = "TS_OFFNET_STALL_WINDOW_SECS";
@@ -102,49 +123,99 @@ const STALL_WINDOW_ENV: &str = "TS_OFFNET_STALL_WINDOW_SECS";
 /// data-path re-home — the control-stall-not-fixed-by-reconnect escalation.
 const CONTROL_FIRES_BEFORE_REHOME: u32 = 3;
 
+/// Backoff applied after a `FullReset` actually fires: the *next* FullReset may only
+/// fire this long after the previous one, doubling per firing up to
+/// [`FULL_RESET_MAX_BACKOFF`]. Prevents a box whose only reachable relay is dead from
+/// churning control registration every stall threshold (~3 min) forever.
+const FULL_RESET_BASE_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Cap on the FullReset backoff (30 minutes).
+const FULL_RESET_MAX_BACKOFF: Duration = Duration::from_secs(1800);
+
 /// Self-message driving the periodic watchdog tick.
 #[derive(Copy, Clone)]
 struct Tick;
 
-/// Off-tailnet watchdog actor.
-///
-/// Spawned by [`crate::control_runner::ControlRunner::on_start`] alongside
-/// [`crate::derp_latency::DerpLatencyMeasurer`]. Subscribes to
-/// `Arc<ts_control::StateUpdate>` on the bus.
-pub struct OffTailnetWatchdog {
-    env: Env,
-    /// When the most recent [`StateUpdate`] was observed.
-    last_state_update: Instant,
-    /// Configured detection threshold. Overridable via `TS_OFFNET_T_DETECT_SECS`.
-    t_detect: Duration,
-    /// Watchdog state machine.
-    state: State,
-    /// Instants of recent [`RxStallEvent`]s, pruned to `stall_window`. The count of
-    /// in-window stalls drives the escalation ladder.
-    rx_stalls: VecDeque<Instant>,
-    /// Sliding window for stall accumulation. Overridable via `TS_OFFNET_STALL_WINDOW_SECS`.
-    stall_window: Duration,
-    /// Consecutive control-stall `ForceReconnect` firings without an intervening
-    /// [`StateUpdate`]. Drives the control-stall-not-fixed-by-reconnect escalation.
-    consecutive_control_fires: u32,
+/// Parse a whole-seconds duration from the environment, falling back to `default` on
+/// absence or any parse error and clamping to `floor` — always loudly (a silently
+/// ignored override would invert the operator's intent).
+pub(crate) fn duration_from_env_or(var: &str, default: Duration, floor: Duration) -> Duration {
+    duration_from_parts(var, std::env::var(var).ok().as_deref(), default, floor)
+}
+
+/// Pure body of [`duration_from_env_or`] so parsing is unit-testable.
+fn duration_from_parts(
+    var: &str,
+    raw: Option<&str>,
+    default: Duration,
+    floor: Duration,
+) -> Duration {
+    match raw.map(str::trim) {
+        None => default,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(secs) => {
+                let parsed = Duration::from_secs(secs);
+                let clamped = parsed.max(floor);
+                if clamped != parsed {
+                    tracing::warn!(
+                        env = var,
+                        requested_secs = secs,
+                        floor_secs = floor.as_secs(),
+                        "duration below floor; clamping"
+                    );
+                }
+                clamped
+            }
+            Err(_) => {
+                tracing::warn!(
+                    env = var,
+                    value = raw,
+                    default_secs = default.as_secs(),
+                    "unparseable duration; using default"
+                );
+                default
+            }
+        },
+    }
+}
+
+/// Resolve the stall escalation window: env-tunable, clamped to
+/// `[3 × stall threshold, 24h]` so the full ladder (three stalls at threshold
+/// cadence) always fits and strikes can't compound across days.
+fn stall_window_from_parts(raw: Option<&str>, threshold_basis: Duration) -> Duration {
+    let floor = threshold_basis.saturating_mul(3);
+    let default = DEFAULT_STALL_ESCALATION_WINDOW.max(floor);
+    let window = duration_from_parts(STALL_WINDOW_ENV, raw, default, floor);
+    let capped = window.min(MAX_STALL_WINDOW);
+    if capped != window {
+        tracing::warn!(
+            env = STALL_WINDOW_ENV,
+            requested_secs = window.as_secs(),
+            cap_secs = MAX_STALL_WINDOW.as_secs(),
+            "stall window above cap; clamping"
+        );
+    }
+    capped
 }
 
 /// Escalation ladder for repeated rx-stalls of the home relay, keyed by how many
 /// stalls landed inside the sliding window (including the one being handled).
 ///
-/// The stalled connection has already recycled itself locally (fresh socket + Noise)
-/// before the event reaches the watchdog, so stage 1 only refreshes the latency picture.
+/// The stalled connection recycles itself locally (fresh socket + Noise) immediately
+/// after publishing the event, so stage 1 only refreshes the latency picture.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum StallEscalation {
-    /// First stall in the window: local recycle already happened; force a fresh
+    /// First stall in the window: local recycle already underway; force a fresh
     /// netcheck so the latency picture is current if the stall repeats.
     Remeasure,
     /// Second stall: the relay is repeatedly one-way-dead — force a lateral re-home
-    /// away from it, overriding anti-flap hysteresis.
+    /// away from it, overriding anti-flap hysteresis and penalty-boxing the region.
     ForceRehome,
     /// Third and subsequent stalls: re-homing did not stick — additionally force a
     /// full control reconnect (fresh Noise + re-registration + fresh derp map), the
-    /// strongest in-process reset that preserves SSH sessions.
+    /// strongest in-process reset that preserves SSH sessions. Subject to the
+    /// [`FULL_RESET_BASE_BACKOFF`] schedule; while backed off, it degrades to the
+    /// `ForceRehome` action (which still refreshes the penalty box).
     FullReset,
 }
 
@@ -185,15 +256,217 @@ enum State {
     Fired(Instant),
 }
 
+/// Pure decision function — no I/O, no clock reads beyond the supplied `now`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Action {
+    /// Do nothing this tick.
+    NoOp,
+    /// Fire a [`ForceReconnect`] and transition to [`State::Fired`]`(now)`.
+    Fire,
+}
+
+fn decide_action(since_update: Duration, t_detect: Duration, state: State, now: Instant) -> Action {
+    match state {
+        State::Idle => {
+            if since_update >= t_detect {
+                Action::Fire
+            } else {
+                Action::NoOp
+            }
+        }
+        State::Fired(fired_at) => {
+            // Only retry after cooldown. A StateUpdate arriving before then resets to Idle
+            // via the StateUpdate handler, so reaching this branch with cooldown elapsed
+            // means the previous ForceReconnect did not recover the stream — legitimate retry.
+            if since_update >= t_detect && now.saturating_duration_since(fired_at) >= T_COOLDOWN {
+                Action::Fire
+            } else {
+                Action::NoOp
+            }
+        }
+    }
+}
+
+/// Recovery action the core asks the actor shell to perform. The shell maps these onto
+/// registry tells; the core stays pure (injected time, no I/O) so the whole ladder is
+/// unit-testable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Command {
+    /// Tell [`DerpLatencyMeasurer`] to re-run netcheck now.
+    Remeasure,
+    /// Tell [`DerpLatencyMeasurer`] to force a re-home, penalty-boxing `avoid`.
+    ForceRehome(Option<RegionId>),
+    /// Tell ControlRunner to rebuild the control connection.
+    ForceReconnect,
+}
+
+/// Exponential backoff gate for `FullReset` firings.
+#[derive(Copy, Clone, Debug)]
+struct FullResetBackoff {
+    last_fired: Option<Instant>,
+    backoff: Duration,
+}
+
+impl FullResetBackoff {
+    const fn new() -> Self {
+        Self {
+            last_fired: None,
+            backoff: Duration::ZERO,
+        }
+    }
+
+    fn ready(&self, now: Instant) -> bool {
+        match self.last_fired {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.backoff,
+        }
+    }
+
+    fn record_fire(&mut self, now: Instant) {
+        self.last_fired = Some(now);
+        self.backoff = if self.backoff.is_zero() {
+            FULL_RESET_BASE_BACKOFF
+        } else {
+            self.backoff.saturating_mul(2).min(FULL_RESET_MAX_BACKOFF)
+        };
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// Functional core of the watchdog: all state transitions with injected time, no I/O.
+struct WatchdogCore {
+    /// When the most recent [`StateUpdate`] was observed.
+    last_state_update: Instant,
+    /// Configured detection threshold. Overridable via `TS_OFFNET_T_DETECT_SECS`.
+    t_detect: Duration,
+    /// Watchdog state machine.
+    state: State,
+    /// Instants of recent [`RxStallEvent`]s, pruned to `stall_window` and capped at
+    /// [`STALL_HISTORY_CAP`]. The count of in-window stalls drives the ladder.
+    rx_stalls: VecDeque<Instant>,
+    /// Sliding window for stall accumulation. Overridable via `TS_OFFNET_STALL_WINDOW_SECS`.
+    stall_window: Duration,
+    /// Region of the most recent stall. A stall from a *different* region clears the
+    /// history — a fresh home region must not inherit the previous region's strikes.
+    last_stall_region: Option<RegionId>,
+    /// Consecutive control-stall `ForceReconnect` firings without an intervening
+    /// [`StateUpdate`]. Drives the control-stall-not-fixed-by-reconnect escalation.
+    consecutive_control_fires: u32,
+    /// Backoff gate for repeated `FullReset`s without recovery.
+    full_reset: FullResetBackoff,
+}
+
+impl WatchdogCore {
+    fn new(t_detect: Duration, stall_window: Duration, now: Instant) -> Self {
+        Self {
+            // Initialise to "now" so we don't fire immediately on a slow startup; the first
+            // real StateUpdate will refresh it, and if none ever arrives the watchdog will
+            // still fire after t_detect.
+            last_state_update: now,
+            t_detect,
+            state: State::Idle,
+            rx_stalls: VecDeque::new(),
+            stall_window,
+            last_stall_region: None,
+            consecutive_control_fires: 0,
+            full_reset: FullResetBackoff::new(),
+        }
+    }
+
+    /// A [`StateUpdate`] was observed: the control stream is alive. Returns whether
+    /// this is a recovery (state was not idle).
+    fn on_state_update(&mut self, now: Instant) -> bool {
+        self.last_state_update = now;
+        let recovered = !matches!(self.state, State::Idle);
+        self.state = State::Idle;
+        self.consecutive_control_fires = 0;
+        recovered
+    }
+
+    /// An rx-stall was reported for `region`. Returns the in-window stall count, the
+    /// ladder stage, and the commands to execute.
+    fn on_rx_stall(
+        &mut self,
+        region: RegionId,
+        now: Instant,
+    ) -> (usize, StallEscalation, Vec<Command>) {
+        if self.last_stall_region.is_some_and(|prev| prev != region) {
+            // Fresh home region: restart the ladder from the bottom.
+            self.rx_stalls.clear();
+            self.full_reset.reset();
+        }
+        self.last_stall_region = Some(region);
+
+        // Sustained recovery: if every previous strike aged out of the window, the
+        // ladder — including the FullReset backoff — restarts from the bottom.
+        if prune_and_count(&mut self.rx_stalls, now, self.stall_window) == 0 {
+            self.full_reset.reset();
+        }
+
+        self.rx_stalls.push_back(now);
+        while self.rx_stalls.len() > STALL_HISTORY_CAP {
+            self.rx_stalls.pop_front();
+        }
+
+        let stalls = self.rx_stalls.len();
+        let escalation = decide_stall_escalation(stalls);
+        let commands = match escalation {
+            StallEscalation::Remeasure => vec![Command::Remeasure],
+            StallEscalation::ForceRehome => vec![Command::ForceRehome(Some(region))],
+            StallEscalation::FullReset => {
+                if self.full_reset.ready(now) {
+                    self.full_reset.record_fire(now);
+                    vec![Command::ForceReconnect, Command::ForceRehome(Some(region))]
+                } else {
+                    // Backed off: skip the control churn, but keep refreshing the
+                    // penalty box so the re-home away from the dead relay sticks.
+                    vec![Command::ForceRehome(Some(region))]
+                }
+            }
+        };
+        (stalls, escalation, commands)
+    }
+
+    /// Periodic tick. Returns the commands to execute.
+    fn on_tick(&mut self, now: Instant) -> Vec<Command> {
+        let since_update = now.saturating_duration_since(self.last_state_update);
+        match decide_action(since_update, self.t_detect, self.state, now) {
+            Action::NoOp => Vec::new(),
+            Action::Fire => {
+                self.consecutive_control_fires = self.consecutive_control_fires.saturating_add(1);
+                self.state = State::Fired(now);
+                let mut commands = vec![Command::ForceReconnect];
+                // Control-stall not fixed by reconnect: after repeated firings without a
+                // single StateUpdate landing, the problem is likely the data path rather
+                // than (or in addition to) the control stream — force a re-home too so
+                // fresh relay connections and fresh netcheck data get a chance.
+                if control_stall_escalates(self.consecutive_control_fires) {
+                    commands.push(Command::ForceRehome(None));
+                }
+                commands
+            }
+        }
+    }
+
+    fn since_update(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_state_update)
+    }
+}
+
+/// Off-tailnet watchdog actor — thin shell around [`WatchdogCore`].
+///
+/// Spawned by [`crate::control_runner::ControlRunner::on_start`] alongside
+/// [`crate::derp_latency::DerpLatencyMeasurer`]. Subscribes to
+/// `Arc<ts_control::StateUpdate>` and [`RxStallEvent`] on the bus.
+pub struct OffTailnetWatchdog {
+    env: Env,
+    core: WatchdogCore,
+}
+
 impl OffTailnetWatchdog {
-    fn t_detect_from_env_or_default() -> Duration {
-        duration_from_env_or(T_DETECT_ENV, DEFAULT_T_DETECT)
-    }
-
-    fn stall_window_from_env_or_default() -> Duration {
-        duration_from_env_or(STALL_WINDOW_ENV, DEFAULT_STALL_ESCALATION_WINDOW)
-    }
-
     /// Best-effort tell to the canonical [`DerpLatencyMeasurer`]; errors are logged,
     /// never propagated — the watchdog must survive any bus/registry failure.
     async fn tell_latency_measurer<M>(&self, msg: M)
@@ -216,16 +489,15 @@ impl OffTailnetWatchdog {
             tracing::error!(error = %e, "sending ForceReconnect to ControlRunner");
         }
     }
-}
 
-/// Parse a whole-seconds duration from the environment, falling back to `default` on
-/// absence or any parse error (unknown-on-error).
-fn duration_from_env_or(var: &str, default: Duration) -> Duration {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(default)
+    /// Execute a core-issued recovery command (best-effort, never propagates).
+    async fn run_command(&self, command: Command) {
+        match command {
+            Command::Remeasure => self.tell_latency_measurer(Remeasure).await,
+            Command::ForceRehome(avoid) => self.tell_latency_measurer(ForceRehome { avoid }).await,
+            Command::ForceReconnect => self.tell_force_reconnect().await,
+        }
+    }
 }
 
 impl kameo::Actor for OffTailnetWatchdog {
@@ -245,22 +517,30 @@ impl kameo::Actor for OffTailnetWatchdog {
             ))
             .await?;
 
+        // Deterministic per-node jitter (+0–20%) so the two koidra-ssh processes on
+        // one box never fire their control-reconnect ladders in lockstep.
+        let seed = jitter_seed(&env.keys.node_keys.public);
+        let t_detect = jittered(
+            duration_from_env_or(T_DETECT_ENV, DEFAULT_T_DETECT, MIN_T_DETECT),
+            seed,
+        );
+        let threshold_basis = RxStallConfig::from_env()
+            .stall_threshold
+            .unwrap_or(RxStallConfig::DEFAULT_STALL_THRESHOLD);
+        let stall_window = stall_window_from_parts(
+            std::env::var(STALL_WINDOW_ENV).ok().as_deref(),
+            threshold_basis,
+        );
+
         tracing::trace!(
-            t_detect_secs = Self::t_detect_from_env_or_default().as_secs(),
+            t_detect_secs = t_detect.as_secs(),
+            stall_window_secs = stall_window.as_secs(),
             "off-tailnet watchdog running"
         );
 
         Ok(Self {
             env,
-            // Initialise to "now" so we don't fire immediately on a slow startup; the first
-            // real StateUpdate will refresh it, and if none ever arrives the watchdog will
-            // still fire after t_detect.
-            last_state_update: Instant::now(),
-            t_detect: Self::t_detect_from_env_or_default(),
-            state: State::Idle,
-            rx_stalls: VecDeque::new(),
-            stall_window: Self::stall_window_from_env_or_default(),
-            consecutive_control_fires: 0,
+            core: WatchdogCore::new(t_detect, stall_window, Instant::now()),
         })
     }
 }
@@ -274,12 +554,9 @@ impl Message<Arc<ts_control::StateUpdate>> for OffTailnetWatchdog {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // Any StateUpdate on the bus is proof of a live control stream. Refresh + reset.
-        self.last_state_update = Instant::now();
-        if !matches!(self.state, State::Idle) {
+        if self.core.on_state_update(Instant::now()) {
             tracing::info!("control stream recovered; returning to idle");
         }
-        self.state = State::Idle;
-        self.consecutive_control_fires = 0;
     }
 }
 
@@ -291,10 +568,7 @@ impl Message<RxStallEvent> for OffTailnetWatchdog {
         msg: RxStallEvent,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let now = Instant::now();
-        self.rx_stalls.push_back(now);
-        let stalls = prune_and_count(&mut self.rx_stalls, now, self.stall_window);
-        let escalation = decide_stall_escalation(stalls);
+        let (stalls, escalation, commands) = self.core.on_rx_stall(msg.region_id, Instant::now());
 
         tracing::warn!(
             region_id = %msg.region_id,
@@ -305,33 +579,10 @@ impl Message<RxStallEvent> for OffTailnetWatchdog {
             "home derp rx-stall reported; escalating"
         );
 
-        // Every stage is a best-effort in-process action; the connection itself already
-        // recycled locally (fresh socket + Noise) before this event was published.
-        match escalation {
-            StallEscalation::Remeasure => {
-                // Refresh the latency picture (re-netcheck) so a repeat stall re-homes
-                // onto current data.
-                self.tell_latency_measurer(Remeasure).await;
-            }
-            StallEscalation::ForceRehome => {
-                // Lateral relay swap, overriding anti-flap hysteresis and deprioritizing
-                // the stalled region (it may still answer UDP latency probes while its
-                // TCP relay return path is dead).
-                self.tell_latency_measurer(ForceRehome {
-                    avoid: Some(msg.region_id),
-                })
-                .await;
-            }
-            StallEscalation::FullReset => {
-                // Strongest in-process reset that preserves SSH sessions: fresh control
-                // connection (fresh Noise + re-registration + fresh derp map) plus a
-                // forced re-home away from the stalled region.
-                self.tell_force_reconnect().await;
-                self.tell_latency_measurer(ForceRehome {
-                    avoid: Some(msg.region_id),
-                })
-                .await;
-            }
+        // Every stage is a best-effort in-process action; the connection itself
+        // recycles locally (fresh socket + Noise) right after publishing the event.
+        for command in commands {
+            self.run_command(command).await;
         }
     }
 }
@@ -341,74 +592,25 @@ impl Message<Tick> for OffTailnetWatchdog {
 
     async fn handle(&mut self, _: Tick, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let now = Instant::now();
-        let since_update = now.duration_since(self.last_state_update);
+        let commands = self.core.on_tick(now);
 
-        match decide_action(since_update, self.t_detect, self.state, now) {
-            Action::NoOp => {
-                tracing::trace!(
-                    since_update_secs = since_update.as_secs(),
-                    state = ?self.state,
-                    "watchdog tick; no action"
-                );
-            }
-            Action::Fire => {
-                self.consecutive_control_fires = self.consecutive_control_fires.saturating_add(1);
-                tracing::warn!(
-                    since_update_secs = since_update.as_secs(),
-                    t_detect_secs = self.t_detect.as_secs(),
-                    consecutive_fires = self.consecutive_control_fires,
-                    "off-tailnet detected (no StateUpdate within threshold); forcing control reconnect"
-                );
-                self.tell_force_reconnect().await;
-
-                // Control-stall not fixed by reconnect: after repeated firings without a
-                // single StateUpdate landing, the problem is likely the data path rather
-                // than (or in addition to) the control stream — force a re-home too so
-                // fresh relay connections and fresh netcheck data get a chance.
-                if control_stall_escalates(self.consecutive_control_fires) {
-                    tracing::warn!(
-                        consecutive_fires = self.consecutive_control_fires,
-                        "control reconnects not restoring StateUpdates; forcing derp re-home"
-                    );
-                    self.tell_latency_measurer(ForceRehome { avoid: None })
-                        .await;
-                }
-
-                self.state = State::Fired(now);
-            }
+        if commands.is_empty() {
+            tracing::trace!(
+                since_update_secs = self.core.since_update(now).as_secs(),
+                state = ?self.core.state,
+                "watchdog tick; no action"
+            );
+        } else {
+            tracing::warn!(
+                since_update_secs = self.core.since_update(now).as_secs(),
+                t_detect_secs = self.core.t_detect.as_secs(),
+                consecutive_fires = self.core.consecutive_control_fires,
+                "off-tailnet detected (no StateUpdate within threshold); forcing control reconnect"
+            );
         }
-    }
-}
 
-/// Pure decision function — no I/O, no clock reads beyond the supplied `now`.
-///
-/// Kept separate from the actor so it can be unit-tested in isolation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Action {
-    /// Do nothing this tick.
-    NoOp,
-    /// Fire a [`ForceReconnect`] and transition to [`State::Fired`]`(now)`.
-    Fire,
-}
-
-fn decide_action(since_update: Duration, t_detect: Duration, state: State, now: Instant) -> Action {
-    match state {
-        State::Idle => {
-            if since_update >= t_detect {
-                Action::Fire
-            } else {
-                Action::NoOp
-            }
-        }
-        State::Fired(fired_at) => {
-            // Only retry after cooldown. A StateUpdate arriving before then resets to Idle
-            // via the StateUpdate handler, so reaching this branch with cooldown elapsed
-            // means the previous ForceReconnect did not recover the stream — legitimate retry.
-            if since_update >= t_detect && now.duration_since(fired_at) >= T_COOLDOWN {
-                Action::Fire
-            } else {
-                Action::NoOp
-            }
+        for command in commands {
+            self.run_command(command).await;
         }
     }
 }
@@ -417,18 +619,34 @@ fn decide_action(since_update: Duration, t_detect: Duration, state: State, now: 
 mod tests {
     use std::{
         collections::VecDeque,
+        num::NonZeroU32,
         time::{Duration, Instant},
     };
 
+    use ts_derp::RegionId;
+
     use super::{
-        Action, CONTROL_FIRES_BEFORE_REHOME, DEFAULT_STALL_ESCALATION_WINDOW, StallEscalation,
-        State, T_COOLDOWN, control_stall_escalates, decide_action, decide_stall_escalation,
-        prune_and_count,
+        Action, CONTROL_FIRES_BEFORE_REHOME, Command, DEFAULT_STALL_ESCALATION_WINDOW,
+        FULL_RESET_BASE_BACKOFF, FULL_RESET_MAX_BACKOFF, MAX_STALL_WINDOW, STALL_HISTORY_CAP,
+        StallEscalation, State, T_COOLDOWN, WatchdogCore, control_stall_escalates, decide_action,
+        decide_stall_escalation, duration_from_parts, prune_and_count, stall_window_from_parts,
     };
 
     fn now() -> Instant {
         // Stable reference; arithmetic via checked_add so tests are deterministic.
         Instant::now()
+    }
+
+    fn r(n: u32) -> RegionId {
+        RegionId(NonZeroU32::new(n).unwrap())
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn core(t_detect: Duration, window: Duration, t0: Instant) -> WatchdogCore {
+        WatchdogCore::new(t_detect, window, t0)
     }
 
     #[test]
@@ -575,6 +793,8 @@ mod tests {
         // The default detection threshold must be comfortably longer than the poll interval,
         // otherwise a single missed poll could trigger a false fire on the next one.
         assert!(super::DEFAULT_T_DETECT > super::POLL_INTERVAL * 2);
+        // And the env floor preserves the same property.
+        assert!(super::MIN_T_DETECT >= super::POLL_INTERVAL * 2);
     }
 
     #[test]
@@ -621,49 +841,149 @@ mod tests {
     }
 
     #[test]
+    fn stall_window_prune_boundary_keeps_event_at_exactly_window_age() {
+        // Boundary semantics: an event aged exactly `window` is still in-window
+        // (prune uses strict `>`), one second past it is out.
+        let t0 = Instant::now();
+        let window = Duration::from_secs(900);
+        let mut stalls: VecDeque<Instant> = VecDeque::new();
+        stalls.push_back(t0);
+        assert_eq!(prune_and_count(&mut stalls, t0 + window, window), 1);
+        assert_eq!(
+            prune_and_count(&mut stalls, t0 + window + secs(1), window),
+            0
+        );
+    }
+
+    #[test]
     fn isolated_stalls_never_escalate_past_remeasure() {
         // One stall per >window interval — e.g. genuinely rare blips — must always
         // stay at stage 1, never accumulate to a forced re-home.
         let t0 = Instant::now();
         let window = DEFAULT_STALL_ESCALATION_WINDOW;
-        let mut stalls: VecDeque<Instant> = VecDeque::new();
+        let mut c = core(secs(180), window, t0);
 
         for i in 0..5u64 {
             let now = t0 + (window + Duration::from_secs(60)) * (i as u32 + 1);
-            stalls.push_back(now);
-            let count = prune_and_count(&mut stalls, now, window);
-            assert_eq!(decide_stall_escalation(count), StallEscalation::Remeasure);
+            let (_, escalation, commands) = c.on_rx_stall(r(1), now);
+            assert_eq!(escalation, StallEscalation::Remeasure);
+            assert_eq!(commands, vec![Command::Remeasure]);
         }
     }
 
     #[test]
     fn repeated_stalls_of_dead_relay_walk_the_full_ladder() {
-        // Behavior harness (escalation side of the redsun/dfw timeline): the home
+        // Behavior harness (escalation side of the cross-region timeline): the home
         // relay is one-way-dead, so the connection recycles + re-stalls roughly every
-        // stall-threshold. The watchdog must walk Remeasure → ForceRehome → FullReset.
+        // stall-threshold. The watchdog must walk Remeasure → ForceRehome → FullReset,
+        // with the re-home stages penalty-boxing the dead region.
         let t0 = Instant::now();
-        let window = DEFAULT_STALL_ESCALATION_WINDOW;
-        let mut stalls: VecDeque<Instant> = VecDeque::new();
-        let mut stages = Vec::new();
+        let mut c = core(secs(180), DEFAULT_STALL_ESCALATION_WINDOW, t0);
+        let region = r(7);
 
-        for i in 0..3u64 {
-            let now = t0 + Duration::from_secs(180 * (i + 1)); // stall cadence ≈ threshold
-            stalls.push_back(now);
-            let count = prune_and_count(&mut stalls, now, window);
-            stages.push(decide_stall_escalation(count));
-        }
+        let (_, s1, cmd1) = c.on_rx_stall(region, t0 + secs(180));
+        let (_, s2, cmd2) = c.on_rx_stall(region, t0 + secs(360));
+        let (_, s3, cmd3) = c.on_rx_stall(region, t0 + secs(540));
 
         assert_eq!(
-            stages,
-            vec![
+            (s1, s2, s3),
+            (
                 StallEscalation::Remeasure,
                 StallEscalation::ForceRehome,
                 StallEscalation::FullReset,
-            ]
+            )
+        );
+        assert_eq!(cmd1, vec![Command::Remeasure]);
+        assert_eq!(cmd2, vec![Command::ForceRehome(Some(region))]);
+        assert_eq!(
+            cmd3,
+            vec![Command::ForceReconnect, Command::ForceRehome(Some(region))]
         );
     }
 
-    // ---- control-stall-not-fixed-by-reconnect escalation ----
+    #[test]
+    fn stall_history_from_previous_region_is_cleared_on_region_change() {
+        // Two strikes on region A, then the home moves and region B stalls: B must
+        // start at the bottom of the ladder, not inherit A's count.
+        let t0 = Instant::now();
+        let mut c = core(secs(180), DEFAULT_STALL_ESCALATION_WINDOW, t0);
+        c.on_rx_stall(r(1), t0 + secs(180));
+        c.on_rx_stall(r(1), t0 + secs(360));
+
+        let (stalls, escalation, commands) = c.on_rx_stall(r(2), t0 + secs(540));
+        assert_eq!(stalls, 1);
+        assert_eq!(escalation, StallEscalation::Remeasure);
+        assert_eq!(commands, vec![Command::Remeasure]);
+    }
+
+    #[test]
+    fn full_reset_backs_off_exponentially_on_a_dead_only_relay() {
+        // Single-reachable-region box with a dead relay: stalls arrive every ~180s
+        // forever. FullReset must not fire every stall — after the first, subsequent
+        // ones are gated by the exponential backoff and degrade to penalty-box
+        // refreshes (ForceRehome) instead of control churn.
+        let t0 = Instant::now();
+        let mut c = core(secs(180), DEFAULT_STALL_ESCALATION_WINDOW, t0);
+        let region = r(1);
+
+        let mut reconnects = Vec::new();
+        for i in 1..=20u64 {
+            let now = t0 + secs(180 * i);
+            let (_, _, commands) = c.on_rx_stall(region, now);
+            if commands.contains(&Command::ForceReconnect) {
+                reconnects.push(180 * i);
+            }
+            // Every FullReset-stage stall still refreshes the penalty box.
+            if i >= 2 {
+                assert!(commands.contains(&Command::ForceRehome(Some(region))) || i == 2);
+            }
+        }
+
+        // First FullReset at stall #3 (540s). Next allowed >= 540+300 => stall at 900s.
+        // Then backoff 600 => next >= 1500 => stall at 1620s. Then 1200 => >= 2820 =>
+        // stall at 2880s. Then 1800 (capped).
+        assert_eq!(reconnects, vec![540, 900, 1620, 2880]);
+    }
+
+    #[test]
+    fn full_reset_backoff_resets_after_a_quiet_window() {
+        // A stall-free window (sustained recovery) restarts the ladder AND the
+        // FullReset backoff.
+        let t0 = Instant::now();
+        let window = DEFAULT_STALL_ESCALATION_WINDOW;
+        let mut c = core(secs(180), window, t0);
+        let region = r(1);
+
+        // Walk to FullReset once.
+        c.on_rx_stall(region, t0 + secs(180));
+        c.on_rx_stall(region, t0 + secs(360));
+        let (_, _, cmd) = c.on_rx_stall(region, t0 + secs(540));
+        assert!(cmd.contains(&Command::ForceReconnect));
+
+        // Quiet for > window, then a fresh incident: ladder starts at Remeasure.
+        let t1 = t0 + secs(540) + window + secs(60);
+        let (stalls, escalation, _) = c.on_rx_stall(region, t1);
+        assert_eq!((stalls, escalation), (1, StallEscalation::Remeasure));
+
+        // And when it walks back up to FullReset, the backoff gate is fresh (fires
+        // immediately again rather than being stuck at a doubled interval).
+        c.on_rx_stall(region, t1 + secs(180));
+        let (_, _, cmd) = c.on_rx_stall(region, t1 + secs(360));
+        assert!(cmd.contains(&Command::ForceReconnect));
+    }
+
+    #[test]
+    fn stall_history_is_capped() {
+        let t0 = Instant::now();
+        // Absurdly wide window so nothing prunes by age.
+        let mut c = core(secs(180), MAX_STALL_WINDOW, t0);
+        for i in 0..(STALL_HISTORY_CAP as u64 + 40) {
+            c.on_rx_stall(r(1), t0 + secs(i));
+        }
+        assert!(c.rx_stalls.len() <= STALL_HISTORY_CAP);
+    }
+
+    // ---- control-stall-not-fixed-by-reconnect escalation (T-F5 via the core) ----
 
     #[test]
     fn control_stall_escalates_only_after_repeated_failed_reconnects() {
@@ -675,9 +995,231 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_control_fires_reset_by_state_update_between_ticks() {
+        // Fire twice (cooldown-spaced), then a StateUpdate lands, then the stream
+        // stalls again: the re-home escalation counter must have restarted — the
+        // third and fourth fires stay plain ForceReconnects.
+        let t0 = Instant::now();
+        let t_detect = secs(180);
+        let mut c = core(t_detect, DEFAULT_STALL_ESCALATION_WINDOW, t0);
+
+        let cmds1 = c.on_tick(t0 + secs(180));
+        assert_eq!(cmds1, vec![Command::ForceReconnect]);
+        let cmds2 = c.on_tick(t0 + secs(180) + T_COOLDOWN);
+        assert_eq!(cmds2, vec![Command::ForceReconnect]);
+
+        // Control recovers briefly.
+        assert!(c.on_state_update(t0 + secs(300)));
+
+        // Stalls again: fires 1 and 2 of the *new* streak — no re-home command.
+        let t1 = t0 + secs(300);
+        assert_eq!(c.on_tick(t1 + t_detect), vec![Command::ForceReconnect]);
+        assert_eq!(
+            c.on_tick(t1 + t_detect + T_COOLDOWN),
+            vec![Command::ForceReconnect]
+        );
+        // Third consecutive fire without recovery: now the re-home escalation joins.
+        assert_eq!(
+            c.on_tick(t1 + t_detect + T_COOLDOWN * 2),
+            vec![Command::ForceReconnect, Command::ForceRehome(None)]
+        );
+    }
+
+    #[test]
     fn stall_window_holds_the_whole_ladder_at_default_cadence() {
         // With the default 180s stall threshold, three consecutive stalls span ~540s;
         // the escalation window must keep all three in scope or FullReset is unreachable.
         assert!(DEFAULT_STALL_ESCALATION_WINDOW >= Duration::from_secs(3 * 180));
+    }
+
+    #[test]
+    fn full_reset_backoff_bounds_are_sane() {
+        assert!(FULL_RESET_BASE_BACKOFF >= secs(180));
+        assert!(FULL_RESET_MAX_BACKOFF <= secs(1800));
+        assert!(FULL_RESET_BASE_BACKOFF < FULL_RESET_MAX_BACKOFF);
+    }
+
+    // ---- env parsing: floors, caps, loud fallbacks (T-F4) ----
+
+    #[test]
+    fn duration_from_parts_parses_clamps_and_falls_back() {
+        let default = secs(180);
+        let floor = secs(60);
+        let cases: &[(Option<&str>, Duration)] = &[
+            (None, default),
+            (Some("240"), secs(240)),
+            (Some(" 240 "), secs(240)),
+            (Some("60"), secs(60)),
+            (Some("59"), floor), // below floor -> clamped
+            (Some("0"), floor),  // zero -> clamped, never "instant fire"
+            (Some(""), default), // garbage -> default
+            (Some("abc"), default),
+            (Some("-5"), default),
+            (Some("1.5"), default),
+            (Some("9999999999999999999999"), default), // overflow -> default
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                duration_from_parts("TEST_VAR", *raw, default, floor),
+                *expected,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stall_window_clamps_to_ladder_floor_and_day_cap() {
+        let threshold = secs(180);
+        // Default basis.
+        assert_eq!(
+            stall_window_from_parts(None, threshold),
+            DEFAULT_STALL_ESCALATION_WINDOW
+        );
+        // Below 3x threshold -> floored so the full ladder always fits.
+        assert_eq!(stall_window_from_parts(Some("60"), threshold), secs(540));
+        // Above a day -> capped.
+        assert_eq!(
+            stall_window_from_parts(Some("999999"), threshold),
+            MAX_STALL_WINDOW
+        );
+        // A larger configured threshold raises the floor (and the default with it).
+        assert_eq!(stall_window_from_parts(None, secs(600)), secs(1800));
+    }
+}
+
+#[cfg(test)]
+mod e2e_tests {
+    //! End-to-end actor test: real [`Env`] (bus + registry + scheduler), real
+    //! [`DerpLatencyMeasurer`], real [`OffTailnetWatchdog`] — a wiring bug (wrong
+    //! event type, subscribe-after-publish, actor not spawned, registry-tell to the
+    //! wrong name) must fail here even when every pure test passes.
+
+    use std::{num::NonZeroU32, sync::Arc, time::Duration};
+
+    use kameo::actor::Spawn as _;
+    use tokio::sync::mpsc;
+    use ts_derp::RegionId;
+
+    use crate::{
+        derp_latency::{DerpLatencyMeasurement, DerpLatencyMeasurer},
+        env::Env,
+        multiderp::RxStallEvent,
+        offtailnet_watchdog::OffTailnetWatchdog,
+    };
+
+    /// Probe actor observing every published [`DerpLatencyMeasurement`].
+    struct MeasurementProbe {
+        tx: mpsc::UnboundedSender<DerpLatencyMeasurement>,
+    }
+
+    impl kameo::Actor for MeasurementProbe {
+        type Args = (Env, mpsc::UnboundedSender<DerpLatencyMeasurement>);
+        type Error = crate::Error;
+
+        async fn on_start(
+            (env, tx): Self::Args,
+            slf: kameo::actor::ActorRef<Self>,
+        ) -> Result<Self, Self::Error> {
+            env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
+            env.register(None, &slf).await?;
+            Ok(Self { tx })
+        }
+    }
+
+    impl kameo::message::Message<DerpLatencyMeasurement> for MeasurementProbe {
+        type Reply = ();
+
+        async fn handle(
+            &mut self,
+            msg: DerpLatencyMeasurement,
+            _: &mut kameo::message::Context<Self, Self::Reply>,
+        ) {
+            drop(self.tx.send(msg));
+        }
+    }
+
+    fn empty_state_update() -> Arc<ts_control::StateUpdate> {
+        Arc::new(ts_control::StateUpdate {
+            // Empty derp map: `measure_derp_map` runs with zero probes (no network),
+            // returns an empty measurement, and the measurer publishes it.
+            derp: Some(ts_control::DerpMap::new()),
+            node: None,
+            peer_update: None,
+            ping: None,
+            packetfilter: None,
+            pop_browser_url: None,
+            dial_plan: None,
+        })
+    }
+
+    async fn next_measurement(
+        rx: &mut mpsc::UnboundedReceiver<DerpLatencyMeasurement>,
+        env: &Env,
+    ) -> DerpLatencyMeasurement {
+        match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+            Ok(m) => m.expect("probe alive"),
+            Err(_) => panic!(
+                "no measurement within timeout (registry alive={}, bus alive={})",
+                env.registry.is_alive(),
+                env.bus.is_alive()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn rx_stall_ladder_drives_rehome_through_real_bus_and_registry() {
+        let env = Env::new(ts_keys::NodeState::generate());
+
+        let measurer = DerpLatencyMeasurer::spawn(env.clone());
+        let watchdog = OffTailnetWatchdog::spawn(env.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _probe = MeasurementProbe::spawn((env.clone(), tx));
+
+        // All three register at the end of their on_start; waiting on the registry
+        // guarantees their bus subscriptions are in place before we publish.
+        env.wait::<DerpLatencyMeasurer>(None).await.unwrap();
+        env.wait::<OffTailnetWatchdog>(None).await.unwrap();
+        env.wait::<MeasurementProbe>(None).await.unwrap();
+
+        // Control delivers a (derp-empty) map: measurement #1.
+        env.publish(empty_state_update()).await.unwrap();
+        let m1 = next_measurement(&mut rx, &env).await;
+        assert!(m1.measurement.is_empty());
+
+        let region = RegionId(NonZeroU32::new(1).unwrap());
+        let stall = |n: u64| RxStallEvent {
+            region_id: region,
+            stalled_for: Duration::from_secs(180 * n),
+            pkts_sent_since_recv: 0,
+        };
+
+        // Stall #1 → watchdog Remeasure → measurer publishes measurement #2.
+        env.publish_noretain(stall(1)).await.unwrap();
+        next_measurement(&mut rx, &env).await;
+
+        // Stall #2 → watchdog ForceRehome{avoid} → measurer publishes measurement #3.
+        env.publish_noretain(stall(2)).await.unwrap();
+        next_measurement(&mut rx, &env).await;
+
+        // A StateUpdate interleaved between escalations must not disturb the ladder
+        // (and resets the control-fire streak): measurement #4 from the map delivery.
+        env.publish(empty_state_update()).await.unwrap();
+        next_measurement(&mut rx, &env).await;
+
+        // Stall #3 → FullReset: ForceReconnect targets a ControlRunner that is NOT
+        // spawned — the watchdog must survive the failed registry tell (crash-proof)
+        // and still deliver the ForceRehome: measurement #5.
+        env.publish_noretain(stall(3)).await.unwrap();
+        next_measurement(&mut rx, &env).await;
+
+        assert!(watchdog.is_alive(), "watchdog survived the full ladder");
+        assert!(measurer.is_alive(), "measurer survived the full ladder");
+        // Regression guard: the misaddressed ForceReconnect tell (no ControlRunner)
+        // once killed the Registry actor via kameo's unhandled-error handling,
+        // silently dropping every queued forward. The registry must survive it.
+        assert!(
+            env.registry.is_alive(),
+            "registry survived a NotFound forward"
+        );
     }
 }
