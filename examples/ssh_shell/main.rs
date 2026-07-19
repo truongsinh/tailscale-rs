@@ -126,15 +126,17 @@ impl Handler for ShellServer {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
         tracing::debug!(channel = %channel.id(), remote = %self.remote, "new session");
         // Per-channel driver task. Owns the child + all copy pumps. Drains the
         // inbound mpsc via `channel.wait()` so russh's dispatch loop never blocks
-        // on `chan.send(Data)` (see struct doc).
+        // on `chan.send(Data)` (see struct doc). The session handle lets the loop
+        // answer want_reply exec/shell requests (channel_success / channel_failure).
         let remote = self.remote;
+        let handle = session.handle();
         tokio::spawn(async move {
-            channel_loop::run_session(channel, remote).await;
+            channel_loop::run_session(channel, handle, remote).await;
         });
         Ok(true)
     }

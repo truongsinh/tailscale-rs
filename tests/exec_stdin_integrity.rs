@@ -5,14 +5,19 @@
 //! Field reports (charter `tailscale-rs-autonomous-run` line 158) show silent
 //! truncation of stdin at every chunk size tested (1MB → 64KB), no error returned.
 //!
-//! This test mirrors that pattern with raw russh (no tailscale) so the bug can be
-//! reproduced in CI without a real tailnet. If the byte count round-trips exactly,
-//! russh's flow control is healthy and the bug is in ssh_shell's wiring; if it
-//! truncates, russh itself is the culprit.
+//! This test runs the REAL ssh_shell per-channel loop (`channel_loop.rs`, included
+//! via `#[path]`) over raw russh (no tailscale) so the bug can be reproduced in CI
+//! without a real tailnet. If the byte count round-trips exactly, russh's flow
+//! control and ssh_shell's wiring are healthy; if it truncates, one of them is the
+//! culprit.
+
+// The REAL deployed per-channel loop (not a mirror — a mirror stays green
+// while the product breaks). Same wiring as tests/ssh_channel_protocol.rs.
+#[path = "../examples/ssh_shell/channel_loop.rs"]
+mod channel_loop;
 
 use std::{
     net::{SocketAddr, TcpListener},
-    process::Stdio,
     sync::Arc,
     time::Duration,
 };
@@ -21,10 +26,6 @@ use russh::{
     client,
     keys::{Algorithm, PrivateKey},
     server::{self, Auth, Handler, Msg, Server as _, Session},
-};
-use tokio::{
-    io::AsyncWriteExt,
-    process::Command,
 };
 
 /// Total bytes to push through the exec channel. Well above any plausible SSH
@@ -192,7 +193,7 @@ fn next_local_addr() -> SocketAddr {
         .unwrap()
 }
 
-// === Server side: mirrors ssh_shell's ShellServer spawn + pipe pattern ===
+// === Server side: runs ssh_shell's REAL per-channel loop (channel_loop.rs) ===
 
 async fn echo_server(addr: SocketAddr) {
     let config = Arc::new(server::Config {
@@ -219,7 +220,7 @@ impl server::Server for EchoServer {
 }
 
 /// Per-session handler. The actual channel-driving work happens in the task
-/// spawned by [`Handler::channel_open_session`] (see [`run_channel_loop`]).
+/// spawned by [`Handler::channel_open_session`] (see `channel_loop::run_session`).
 #[derive(Clone)]
 struct ShellHandler;
 
@@ -233,148 +234,20 @@ impl Handler for ShellHandler {
     async fn channel_open_session(
         &mut self,
         channel: russh::Channel<Msg>,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        // Canonical russh pattern: spawn a per-channel task that consumes the
-        // channel's mpsc via `channel.wait()` / make_reader(). The data() callback
-        // path DOES NOT drain the mpsc — under load it fills (default bound 100
-        // messages), the dispatch loop's `chan.send(Data).await` blocks, and the
-        // inbound data path deadlocks. See commit message for full root-cause.
+        // Identical wiring to examples/ssh_shell/main.rs: per-channel task that
+        // runs the REAL extracted loop, consuming the channel's mpsc via
+        // `channel.wait()` (the data() callback path does NOT drain the mpsc —
+        // under load it fills, the dispatch loop blocks, and inbound data
+        // deadlocks; see channel_loop.rs docs).
+        let handle = session.handle();
+        let remote = SocketAddr::from(([127, 0, 0, 1], 0));
         tokio::spawn(async move {
-            run_channel_loop(channel).await;
+            channel_loop::run_session(channel, handle, remote).await;
         });
         Ok(true)
     }
-}
-
-/// Per-channel driver. Mirrors what `ShellServer::spawn` + the `data()` callback
-/// do in `examples/ssh_shell/main.rs`, but consumes inbound messages via
-/// `channel.wait()` instead of the data() callback. The data() path DOES NOT
-/// drain the channel's internal mpsc — under load it fills (default bound 100
-/// messages), the dispatch loop's `chan.send(Data).await` blocks, and the
-/// inbound data path deadlocks. See commit message for full root-cause.
-async fn run_channel_loop(mut channel: russh::Channel<Msg>) {
-    // Wait for an exec or shell request before spawning the child.
-    let mut pending_command: Option<String> = None;
-    let mut want_shell = false;
-    loop {
-        let Some(msg) = channel.wait().await else { return };
-        match msg {
-            russh::ChannelMsg::Exec { command, .. } => {
-                pending_command = Some(String::from_utf8_lossy(&command).into_owned());
-                break;
-            }
-            russh::ChannelMsg::RequestShell { .. } => {
-                want_shell = true;
-                break;
-            }
-            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => return,
-            _ => {}
-        }
-    }
-
-    let (shell, flag, cmd_str): (&str, &str, String) = if let Some(cmd) = pending_command {
-        if cfg!(windows) {
-            ("cmd.exe", "/C", cmd)
-        } else {
-            ("/bin/sh", "-c", cmd)
-        }
-    } else if want_shell {
-        if cfg!(windows) {
-            ("cmd.exe", "", String::new())
-        } else {
-            ("/bin/sh", "", String::new())
-        }
-    } else {
-        return;
-    };
-
-    let mut cmd = Command::new(shell);
-    if !flag.is_empty() {
-        cmd.arg(flag);
-    }
-    if !cmd_str.is_empty() {
-        cmd.arg(&cmd_str);
-    }
-
-    let child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(_e) => {
-            drop(channel.exit_status(127).await);
-            drop(channel.eof().await);
-            drop(channel.close().await);
-            return;
-        }
-    };
-
-    let child_stdin = child.stdin.take().unwrap();
-    let mut child_stdout = child.stdout.take().unwrap();
-    let mut child_stderr = child.stderr.take().unwrap();
-
-    // Outbound pumps use make_writer / make_writer_ext — owned values that
-    // don't borrow `channel`, so we can move them into separate tasks while
-    // keeping `channel` alive for the inbound loop and final exit-status send.
-    let mut channel_writer = channel.make_writer();
-    let mut channel_stderr_writer = channel.make_writer_ext(Some(1));
-
-    let stdout_task = tokio::spawn(async move {
-        drop(tokio::io::copy(&mut child_stdout, &mut channel_writer).await);
-    });
-    let stderr_task = tokio::spawn(async move {
-        drop(tokio::io::copy(&mut child_stderr, &mut channel_stderr_writer).await);
-    });
-
-    // Inbound: drain channel.wait() loop, forwarding Data to child's stdin via
-    // an unbounded mpsc. The unbounded channel decouples the wait() loop from
-    // the pipe-write (which can block on cat's stdin buffer), so the mpsc is
-    // drained promptly even when the child is slow.
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let stdin_task = tokio::spawn(async move {
-        let mut stdin = child_stdin;
-        while let Some(chunk) = stdin_rx.recv().await {
-            if stdin.write_all(&chunk).await.is_err() {
-                break;
-            }
-        }
-        // stdin drops here → child sees EOF
-    });
-
-    let mut exit_seen: Option<u32> = None;
-    loop {
-        let Some(msg) = channel.wait().await else { break };
-        match msg {
-            russh::ChannelMsg::Data { data }
-                if stdin_tx.send(data.to_vec()).is_err() =>
-            {
-                break;
-            }
-            russh::ChannelMsg::Data { .. } => {}
-            russh::ChannelMsg::Eof => break,
-            russh::ChannelMsg::ExitStatus { exit_status } => {
-                exit_seen = Some(exit_status);
-            }
-            russh::ChannelMsg::Close => break,
-            _ => {}
-        }
-    }
-    drop(stdin_tx);
-    drop(stdin_task.await);
-    drop(stdout_task.await);
-    drop(stderr_task.await);
-
-    let status = child.wait().await.ok();
-    let code = exit_seen
-        .or_else(|| status.and_then(|s| s.code().map(|c| c as u32)))
-        .unwrap_or(128);
-    drop(channel.exit_status(code).await);
-    drop(channel.eof().await);
-    drop(channel.close().await);
 }
 
 // === Client side: send all data, collect all output, compare ===

@@ -23,14 +23,19 @@
 //!   * `TS_STRESS_TRANSFER_MIB` (default 100)
 //!   * `TS_STRESS_TRANSFER_TIMEOUT_SECS` (default 120)
 //!
-//! Server side mirrors `examples/ssh_shell/main.rs` ShellServer exactly: per-channel task
-//! consuming `channel.wait()`, child stdin drained via unbounded mpsc, child stdout piped
-//! back via `make_writer`. Same shape as `tests/exec_stdin_integrity.rs` — extended here
-//! to the 100 MiB regime.
+//! Server side runs `examples/ssh_shell/channel_loop.rs` — the REAL deployed per-channel
+//! loop, included via `#[path]` (not a mirror): per-channel task consuming
+//! `channel.wait()`, child stdin drained via unbounded mpsc, child stdout piped back via
+//! `make_writer`. Same wiring as `tests/exec_stdin_integrity.rs` — extended here to the
+//! 100 MiB regime.
+
+// The REAL deployed per-channel loop (not a mirror — a mirror stays green
+// while the product breaks). Same wiring as tests/ssh_channel_protocol.rs.
+#[path = "../examples/ssh_shell/channel_loop.rs"]
+mod channel_loop;
 
 use std::{
     net::SocketAddr,
-    process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -39,10 +44,6 @@ use russh::{
     ChannelMsg, client,
     keys::{Algorithm, PrivateKey},
     server::{self, Auth, Handler, Msg, Server as _, Session},
-};
-use tokio::{
-    io::AsyncWriteExt,
-    process::Command,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -189,7 +190,7 @@ fn deterministic_payload(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect()
 }
 
-// === Server side: mirrors `examples/ssh_shell/main.rs` ShellServer spawn + pipe pattern ===
+// === Server side: runs ssh_shell's REAL per-channel loop (channel_loop.rs) ===
 
 async fn cat_server(addr: SocketAddr) {
     let config = Arc::new(server::Config {
@@ -224,110 +225,19 @@ impl Handler for CatHandler {
     async fn channel_open_session(
         &mut self,
         channel: russh::Channel<Msg>,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        // Canonical russh per-channel task pattern (P2 fix): consume the channel mpsc
-        // via `channel.wait()`. The data() callback path does NOT drain the mpsc; under
-        // load it fills (bound 100), the dispatch loop's `chan.send(Data).await` blocks,
-        // and inbound data deadlocks — see commit 8a1a151 root-cause writeup.
-        tokio::spawn(async move { run_channel_loop(channel).await });
+        // Identical wiring to examples/ssh_shell/main.rs: per-channel task that
+        // runs the REAL extracted loop, consuming the channel's mpsc via
+        // `channel.wait()` (P2 fix — the data() callback path does NOT drain
+        // the mpsc; see channel_loop.rs docs and commit 8a1a151).
+        let handle = session.handle();
+        let remote = SocketAddr::from(([127, 0, 0, 1], 0));
+        tokio::spawn(async move {
+            channel_loop::run_session(channel, handle, remote).await;
+        });
         Ok(true)
     }
-}
-
-async fn run_channel_loop(mut channel: russh::Channel<Msg>) {
-    let mut pending_command: Option<String> = None;
-    let mut want_shell = false;
-    loop {
-        let Some(msg) = channel.wait().await else { return };
-        match msg {
-            ChannelMsg::Exec { command, .. } => {
-                pending_command = Some(String::from_utf8_lossy(&command).into_owned());
-                break;
-            }
-            ChannelMsg::RequestShell { .. } => { want_shell = true; break; }
-            ChannelMsg::Eof | ChannelMsg::Close => return,
-            _ => {}
-        }
-    }
-
-    let (shell, flag, cmd_str): (&str, &str, String) = if let Some(cmd) = pending_command {
-        if cfg!(windows) { ("cmd.exe", "/C", cmd) } else { ("/bin/sh", "-c", cmd) }
-    } else if want_shell {
-        if cfg!(windows) { ("cmd.exe", "", String::new()) } else { ("/bin/sh", "", String::new()) }
-    } else {
-        return;
-    };
-
-    let mut cmd = Command::new(shell);
-    if !flag.is_empty() { cmd.arg(flag); }
-    if !cmd_str.is_empty() { cmd.arg(&cmd_str); }
-
-    let child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(_e) => {
-            drop(channel.exit_status(127).await);
-            drop(channel.eof().await);
-            drop(channel.close().await);
-            return;
-        }
-    };
-
-    let child_stdin = child.stdin.take().unwrap();
-    let mut child_stdout = child.stdout.take().unwrap();
-    let mut child_stderr = child.stderr.take().unwrap();
-
-    let mut channel_writer = channel.make_writer();
-    let mut channel_stderr_writer = channel.make_writer_ext(Some(1));
-
-    let stdout_task = tokio::spawn(async move {
-        drop(tokio::io::copy(&mut child_stdout, &mut channel_writer).await);
-    });
-    let stderr_task = tokio::spawn(async move {
-        drop(tokio::io::copy(&mut child_stderr, &mut channel_stderr_writer).await);
-    });
-
-    // Decouple the inbound channel.wait() loop from the pipe-write via an unbounded
-    // mpsc — same shape as the P2 fix (see exec_stdin_integrity.rs).
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let stdin_task = tokio::spawn(async move {
-        let mut stdin = child_stdin;
-        while let Some(chunk) = stdin_rx.recv().await {
-            if stdin.write_all(&chunk).await.is_err() { break; }
-        }
-        // stdin drops → child sees EOF
-    });
-
-    let mut exit_seen: Option<u32> = None;
-    loop {
-        let Some(msg) = channel.wait().await else { break };
-        match msg {
-            ChannelMsg::Data { data } if stdin_tx.send(data.to_vec()).is_err() => break,
-            ChannelMsg::Data { .. } => {}
-            ChannelMsg::Eof => break,
-            ChannelMsg::ExitStatus { exit_status } => exit_seen = Some(exit_status),
-            ChannelMsg::Close => break,
-            _ => {}
-        }
-    }
-    drop(stdin_tx);
-    drop(stdin_task.await);
-    drop(stdout_task.await);
-    drop(stderr_task.await);
-
-    let status = child.wait().await.ok();
-    let code = exit_seen
-        .or_else(|| status.and_then(|s| s.code().map(|c| c as u32)))
-        .unwrap_or(128);
-    drop(channel.exit_status(code).await);
-    drop(channel.eof().await);
-    drop(channel.close().await);
 }
 
 // === Client side ===

@@ -9,7 +9,10 @@
 
 use std::process::Stdio;
 
-use russh::{Channel, ChannelMsg, server::Msg};
+use russh::{
+    Channel, ChannelMsg,
+    server::{Handle, Msg},
+};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 /// Platform's default shell + exec flag.
@@ -25,26 +28,36 @@ fn platform_exec_flag() -> &'static str {
 /// Per-channel session driver: spawn child on first exec/shell request, then
 /// concurrently copy inbound data → child stdin and child stdout/stderr → client
 /// until child exits or client closes.
-pub async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
+///
+/// `handle` is the session handle (`Session::handle()`), used to answer
+/// `want_reply` exec/shell requests with channel_success / channel_failure
+/// (RFC 4254 §6.5) — the reply goes through the session, which this loop
+/// doesn't otherwise own.
+pub async fn run_session(mut channel: Channel<Msg>, handle: Handle, remote: std::net::SocketAddr) {
     // Wait for an exec or shell request before spawning the child.
     let mut pending_command: Option<String> = None;
     let mut want_shell = false;
+    // No dead initializer: every path that leaves the loop via `break` assigns
+    // it, and every other path returns.
+    let want_reply;
     loop {
         let Some(msg) = channel.wait().await else {
             return;
         };
         match msg {
-            ChannelMsg::Exec { command, .. } => {
+            ChannelMsg::Exec { command, want_reply: reply_requested, .. } => {
                 pending_command = Some(String::from_utf8_lossy(&command).into_owned());
+                want_reply = reply_requested;
                 break;
             }
-            ChannelMsg::RequestShell { .. } => {
+            ChannelMsg::RequestShell { want_reply: reply_requested, .. } => {
                 want_shell = true;
+                want_reply = reply_requested;
                 break;
             }
             ChannelMsg::Eof | ChannelMsg::Close => return,
-            // PtyRequest is handled by the Handler::pty_request override above
-            // (which has access to Session for the channel_failure reply). The
+            // PtyRequest is handled by the Handler::pty_request override in
+            // main.rs (which replies through its own Session access). The
             // wait() loop just drops the message here.
             _ => {}
         }
@@ -74,12 +87,26 @@ pub async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, channel = %channel.id(), shell, "spawning process");
+            // RFC 4254 §6.5: a want_reply request must be answered. The request
+            // was not honored, so reply channel_failure before tearing down.
+            if want_reply {
+                let _ = handle.channel_failure(channel.id()).await;
+            }
             drop(channel.exit_status(127).await);
             drop(channel.eof().await);
             drop(channel.close().await);
             return;
         }
     };
+
+    // RFC 4254 §6.5: answer a want_reply exec/shell request with
+    // channel_success once the request is accepted (child spawned). Clients
+    // that gate their I/O on the confirmation (openssh, russh with
+    // exec(true, ..)) hang forever without this. Sent before the stdout/stderr
+    // pumps start so the confirmation precedes any data.
+    if want_reply {
+        let _ = handle.channel_success(channel.id()).await;
+    }
 
     tracing::info!(
         channel = %channel.id(),
@@ -122,30 +149,53 @@ pub async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr
         // stdin drops here → child sees EOF on stdin
     });
 
+    // Two independent completion triggers, either of which must be able to
+    // finish the channel lifecycle (exit-status + eof + close):
+    //   * client half-close (Eof/Close) — the normal `cat`-style path, where
+    //     closing the child's stdin makes it exit; and
+    //   * child exit — an exec that never reads stdin (`echo hi`) run by a
+    //     client that never sends EOF. Waiting only for client EOF here wedged
+    //     such sessions forever.
     let mut exit_seen: Option<u32> = None;
+    let mut child_exit: Option<std::io::Result<std::process::ExitStatus>> = None;
     loop {
-        let Some(msg) = channel.wait().await else { break };
-        match msg {
-            ChannelMsg::Data { data }
-                if stdin_tx.send(data.to_vec()).is_err() =>
-            {
+        tokio::select! {
+            // Cancel-safe: tokio's Child::wait is explicitly cancel safe, and
+            // mpsc recv (behind channel.wait) drops no message on cancel.
+            status = child.wait() => {
+                child_exit = Some(status);
                 break;
             }
-            ChannelMsg::Data { .. } => {}
-            ChannelMsg::Eof => break,
-            ChannelMsg::ExitStatus { exit_status } => {
-                exit_seen = Some(exit_status);
+            msg = channel.wait() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    ChannelMsg::Data { data }
+                        if stdin_tx.send(data.to_vec()).is_err() =>
+                    {
+                        break;
+                    }
+                    ChannelMsg::Data { .. } => {}
+                    ChannelMsg::Eof => break,
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        exit_seen = Some(exit_status);
+                    }
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
             }
-            ChannelMsg::Close => break,
-            _ => {}
         }
     }
     drop(stdin_tx);
     drop(stdin_task.await);
+    // The pumps finish when the child's pipes hit EOF, so on either trigger the
+    // remaining stdout/stderr is flushed to the client before exit-status/close.
     drop(stdout_task.await);
     drop(stderr_task.await);
 
-    let status = child.wait().await;
+    let status = match child_exit {
+        Some(status) => status,
+        None => child.wait().await,
+    };
     let code = match (exit_seen, status) {
         (Some(c), _) => c,
         (None, Ok(s)) => s.code().unwrap_or(128) as u32,

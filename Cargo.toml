@@ -297,3 +297,7 @@ required-features = ["ssh"]
 [[test]]
 name = "bench_harness"
 required-features = ["ssh"]
+
+[[test]]
+name = "ssh_channel_protocol"
+required-features = ["ssh"]

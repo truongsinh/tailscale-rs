@@ -5,9 +5,9 @@
 //!   * Pure unit tests of the shared PRNG (fixture-pinned so client and peer can
 //!     never drift apart silently) and the stats helpers (percentiles, stall
 //!     detection, SINK-line parsing).
-//!   * One in-process end-to-end test: a loopback russh server (same shape as
-//!     `tests/stress_ssh_heavy_transfer.rs`, i.e. the deployed `ssh_shell` exec
-//!     path) whose exec spawns the locally built `ssh_bench_peer` binary, driven
+//!   * One in-process end-to-end test: a loopback russh server running the REAL
+//!     deployed `ssh_shell` per-channel loop (`examples/ssh_shell/channel_loop.rs`,
+//!     included via `#[path]`) whose exec spawns the locally built `ssh_bench_peer` binary, driven
 //!     by the locally built `ssh_bench` binary running `all`. Proves latency,
 //!     upload, download, and duplex all complete losslessly, and prints the
 //!     loopback baseline numbers.
@@ -18,6 +18,11 @@ mod prng;
 #[path = "../examples/ssh_bench/stats.rs"]
 mod stats;
 
+// The REAL deployed per-channel loop (not a mirror — a mirror stays green
+// while the product breaks). Same wiring as tests/ssh_channel_protocol.rs.
+#[path = "../examples/ssh_shell/channel_loop.rs"]
+mod channel_loop;
+
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -27,12 +32,11 @@ use std::{
 };
 
 use russh::{
-    ChannelMsg,
     keys::{Algorithm, PrivateKey},
     server::{self, Auth, Handler, Msg, Server as _, Session},
 };
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::process::Command;
 
 // === PRNG unit tests ===
 
@@ -277,7 +281,7 @@ async fn bench_harness_all_phases_pass_losslessly_on_loopback() {
     );
 }
 
-// === Loopback exec server (mirrors tests/stress_ssh_heavy_transfer.rs) ===
+// === Loopback exec server: runs ssh_shell's REAL per-channel loop (channel_loop.rs) ===
 
 fn next_local_addr() -> SocketAddr {
     use std::net::TcpListener;
@@ -330,95 +334,16 @@ impl Handler for ExecHandler {
     async fn channel_open_session(
         &mut self,
         channel: russh::Channel<Msg>,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        // Canonical russh per-channel task pattern (P2 exec-stdin fix): consume the
-        // channel mpsc via `channel.wait()` — see stress_ssh_heavy_transfer.rs.
-        tokio::spawn(async move { run_channel_loop(channel).await });
+        // Identical wiring to examples/ssh_shell/main.rs: per-channel task that
+        // runs the REAL extracted loop (P2 exec-stdin fix pattern — consume the
+        // channel mpsc via `channel.wait()`; see channel_loop.rs docs).
+        let handle = session.handle();
+        let remote = SocketAddr::from(([127, 0, 0, 1], 0));
+        tokio::spawn(async move {
+            channel_loop::run_session(channel, handle, remote).await;
+        });
         Ok(true)
     }
-}
-
-async fn run_channel_loop(mut channel: russh::Channel<Msg>) {
-    let command = loop {
-        let Some(msg) = channel.wait().await else { return };
-        match msg {
-            ChannelMsg::Exec { command, .. } => {
-                break String::from_utf8_lossy(&command).into_owned();
-            }
-            ChannelMsg::Eof | ChannelMsg::Close => return,
-            _ => {}
-        }
-    };
-
-    let (shell, flag) = if cfg!(windows) {
-        ("cmd.exe", "/C")
-    } else {
-        ("/bin/sh", "-c")
-    };
-    let child = Command::new(shell)
-        .arg(flag)
-        .arg(&command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(_e) => {
-            drop(channel.exit_status(127).await);
-            drop(channel.eof().await);
-            drop(channel.close().await);
-            return;
-        }
-    };
-
-    let child_stdin = child.stdin.take().unwrap();
-    let mut child_stdout = child.stdout.take().unwrap();
-    let mut child_stderr = child.stderr.take().unwrap();
-
-    let mut channel_writer = channel.make_writer();
-    let mut channel_stderr_writer = channel.make_writer_ext(Some(1));
-
-    let stdout_task = tokio::spawn(async move {
-        drop(tokio::io::copy(&mut child_stdout, &mut channel_writer).await);
-    });
-    let stderr_task = tokio::spawn(async move {
-        drop(tokio::io::copy(&mut child_stderr, &mut channel_stderr_writer).await);
-    });
-
-    // Decouple the inbound channel.wait() loop from the pipe-write via an unbounded
-    // mpsc — same shape as the P2 fix (see exec_stdin_integrity.rs).
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let stdin_task = tokio::spawn(async move {
-        let mut stdin = child_stdin;
-        while let Some(chunk) = stdin_rx.recv().await {
-            if stdin.write_all(&chunk).await.is_err() {
-                break;
-            }
-        }
-        // stdin drops → child sees EOF
-    });
-
-    loop {
-        let Some(msg) = channel.wait().await else { break };
-        match msg {
-            ChannelMsg::Data { data } if stdin_tx.send(data.to_vec()).is_err() => break,
-            ChannelMsg::Data { .. } => {}
-            ChannelMsg::Eof => break,
-            ChannelMsg::Close => break,
-            _ => {}
-        }
-    }
-    drop(stdin_tx);
-    drop(stdin_task.await);
-    drop(stdout_task.await);
-    drop(stderr_task.await);
-
-    let status = child.wait().await.ok();
-    let code = status.and_then(|s| s.code().map(|c| c as u32)).unwrap_or(128);
-    drop(channel.exit_status(code).await);
-    drop(channel.eof().await);
-    drop(channel.close().await);
 }
