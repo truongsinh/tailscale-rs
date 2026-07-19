@@ -286,3 +286,14 @@ required-features = ["ssh"]
 
 [[example]]
 name = "koidra_fetch"
+
+[[example]]
+name = "ssh_bench_peer"
+
+[[example]]
+name = "ssh_bench"
+required-features = ["ssh"]
+
+[[test]]
+name = "bench_harness"
+required-features = ["ssh"]
