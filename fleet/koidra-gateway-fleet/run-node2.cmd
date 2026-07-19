@@ -95,7 +95,7 @@ rem ======================== SUPERVISE LOOP ================================= re
     if exist "%DIR%\authkey.txt" set /p AUTHKEY=<"%DIR%\authkey.txt"
     set "AKCHK=!AUTHKEY: =!"
     if not defined AKCHK (
-        >>"%DIR%\koidra-diag.txt" echo [!DATE! !TIME!] run-node2.cmd %CHAN%: authkey.txt missing/empty/whitespace - NOT launching (would crash on bare -k); backing off %MAX_DELAY%s
+        >>"%DIR%\koidra-diag.txt" echo [!DATE! !TIME!] run-node2.cmd %CHAN%: authkey.txt missing/empty/whitespace - NOT launching [would crash on bare -k]; backing off %MAX_DELAY%s
         ping -n 61 127.0.0.1 >nul 2>&1
         goto loop
     )
