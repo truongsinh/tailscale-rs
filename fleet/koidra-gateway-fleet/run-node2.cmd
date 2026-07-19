@@ -100,6 +100,18 @@ rem ======================== SUPERVISE LOOP ================================= re
         goto loop
     )
 
+    rem ---- exe-exists guard (supervision integrity): never launch a binary  rem
+    rem that is not on disk. RCA: a resolved-but-absent exe (a pointer naming a
+    rem file that was never staged / half-updated) made this loop tight-spin
+    rem forever on a missing filename. Mirror the authkey guard above: diagnose +
+    rem back off (so a later-staged exe at this path self-heals on a subsequent
+    rem loop) and NEVER goto loop straight into a missing-file launch spin.
+    if not exist "!EXE!" (
+        >>"%DIR%\koidra-diag.txt" echo [!DATE! !TIME!] run-node2.cmd %CHAN%: resolved exe "!EXE!" missing on disk - NOT launching; backing off %MAX_DELAY%s
+        ping -n 61 127.0.0.1 >nul 2>&1
+        goto loop
+    )
+
     rem ---- start timer (seconds-since-midnight) -------------------------- rem
     rem `100<field> %% 100` yields the field's value for BOTH 1- and 2-digit fields
     rem (e.g. "9"->1009%100=9, "09"->10009%100=9, "23"->10023%100=23) and never

@@ -80,6 +80,7 @@
 !include "MUI2.nsh"
 !include "x64.nsh"
 !include "FileFunc.nsh"   ; GetParameters / GetOptions
+!include "TextFunc.nsh"   ; TrimNewLines (read the pointer file's exe name cleanly)
 
 Name "Koidra Gateway"
 OutFile "koidra-gateway-setup.exe"
@@ -676,6 +677,89 @@ Section "Start koidra-gateway channels" SecStart
             DetailPrint "Non-admin: KoidraGateway.lnk created and supervisor started (both channels)."
         ${EndIf}
     ${EndIf}
+
+    ; ---- SUPERVISION-INTEGRITY POST-INSTALL VALIDATION ------------------- ;
+    ; RCA: a supervised launcher spun forever on an exe filename absent from disk.
+    ; Before this run reports success, verify the task/launcher -> exe binding
+    ; actually resolves to a real file on disk:
+    ;   (a) run-node2.cmd exists (it is what the SYSTEM task action and the
+    ;       supervisor invoke — the stable indirection layer),
+    ;   (b) the exe named by the pointer (current wins over default, same order
+    ;       the launcher uses) exists,
+    ;   (c) the launcher's literal fallback exe (${BIN_VERSIONED}) exists.
+    ; SELF-CORRECT when the pointer names a missing exe but the fallback is good;
+    ; FAIL LOUD (never claim success) when nothing runnable is on disk. Runs for
+    ; BOTH admin + non-admin paths — the exe/pointer/launcher live in $INSTDIR
+    ; either way. /S stays hang-free via the same ${IfNot} ${Silent} MessageBox
+    ; pattern used everywhere else in this file.
+    DetailPrint "Integrity: validating task/launcher exe-on-disk binding..."
+
+    ; (a) run-node2.cmd — the target of the task action + supervisor.vbs.
+    ${IfNot} ${FileExists} "$INSTDIR\run-node2.cmd"
+        DetailPrint "INTEGRITY ABORT: $INSTDIR\run-node2.cmd is missing — the scheduled task / supervisor would invoke a launcher that is not on disk."
+        SetErrorLevel 2
+        ${IfNot} ${Silent}
+            MessageBox MB_OK|MB_ICONSTOP "INTEGRITY ABORT: $INSTDIR\run-node2.cmd is missing. The scheduled task and supervisor both invoke this launcher; without it the channels can never start. Investigate the staging step and re-run."
+        ${EndIf}
+        Abort
+    ${EndIf}
+
+    ; (b) exe named by the pointer — current-koidra-gateway.txt if present, else
+    ;     default-koidra-gateway.txt (the launcher's own current>default order).
+    StrCpy $R2 ""          ; $R2 = pointer file actually consulted
+    StrCpy $R3 ""          ; $R3 = exe name it names
+    ${If} ${FileExists} "$INSTDIR\current-koidra-gateway.txt"
+        StrCpy $R2 "$INSTDIR\current-koidra-gateway.txt"
+    ${ElseIf} ${FileExists} "$INSTDIR\default-koidra-gateway.txt"
+        StrCpy $R2 "$INSTDIR\default-koidra-gateway.txt"
+    ${EndIf}
+    ${If} $R2 != ""
+        ClearErrors
+        FileOpen $R4 "$R2" r
+        ${IfNot} ${Errors}
+            FileRead $R4 $R3
+            FileClose $R4
+            ${TrimNewLines} $R3 $R3   ; pointer content is one line; strip any CR/LF
+        ${EndIf}
+    ${EndIf}
+
+    StrCpy $R5 0    ; $R5 = 1 when the pointed-to exe exists on disk
+    ${If} $R3 != ""
+    ${AndIf} ${FileExists} "$INSTDIR\$R3"
+        StrCpy $R5 1
+    ${EndIf}
+
+    StrCpy $R6 0    ; $R6 = 1 when the literal fallback ${BIN_VERSIONED} exists
+    ${If} ${FileExists} "$INSTDIR\${BIN_VERSIONED}"
+        StrCpy $R6 1
+    ${EndIf}
+
+    ${If} $R5 == 1
+        ; Pointer resolves to a real exe — the common, healthy path.
+        DetailPrint "Integrity: pointer ($R2) -> $R3 exists on disk; task/launcher binding valid."
+    ${ElseIf} $R6 == 1
+        ; SELF-CORRECT: pointer names a missing exe, but the literal fallback
+        ; (${BIN_VERSIONED}) IS on disk — rewrite the pointer to it so the launcher
+        ; resolves a real file instead of spinning on the absent name.
+        DetailPrint "INTEGRITY WARNING: pointer ($R2) names a missing exe ($R3); self-correcting to ${BIN_VERSIONED} (present on disk)."
+        ${If} $R2 == ""
+            StrCpy $R2 "$INSTDIR\current-koidra-gateway.txt"
+        ${EndIf}
+        FileOpen $R4 "$R2" w
+        FileWrite $R4 "${BIN_VERSIONED}"
+        FileClose $R4
+        DetailPrint "Integrity: rewrote $R2 -> ${BIN_VERSIONED}; launcher now resolves a real exe on disk."
+    ${Else}
+        ; FAIL LOUD: neither the pointed-to exe nor the literal fallback is on
+        ; disk — the supervised launcher would spin forever on an absent file.
+        DetailPrint "INTEGRITY ABORT: no runnable exe on disk — pointer names '$R3' (absent) and fallback ${BIN_VERSIONED} is also absent."
+        SetErrorLevel 2
+        ${IfNot} ${Silent}
+            MessageBox MB_OK|MB_ICONSTOP "INTEGRITY ABORT: no koidra-gateway exe is on disk. The version pointer names '$R3' (not present) and the launcher's literal fallback ${BIN_VERSIONED} is also missing. The supervised launcher would spin forever on an absent file. Investigate the exe staging (File /oname) and re-run."
+        ${EndIf}
+        Abort
+    ${EndIf}
+    DetailPrint "Integrity: task -> run-node2.cmd binding intact and an exe-on-disk is guaranteed."
 SectionEnd
 
 ; --------------------------------------------------------------------------- ;

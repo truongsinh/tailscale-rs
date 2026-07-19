@@ -56,6 +56,22 @@ conf="$dir/node-$channel.json"
 # Fail loudly (not a silent set -u abort) if the unit didn't bake the key.
 authkey="${AUTHKEY:?AUTHKEY not set — bake it into the unit Environment=}"
 
+# ---- exe-exists guard (supervision integrity) -------------------------------
+# Never `exec` a binary that is not on disk. RCA: a resolved-but-absent exe (a
+# pointer naming a file that was never staged / a half-finished update) makes
+# `exec` fail and systemd Restart=on-failure tight-spin forever on a missing
+# filename. Instead log + back off, then exit so systemd restarts us — which
+# re-resolves the pointer above and self-heals once a good exe/pointer lands.
+# systemd IS this script's supervise loop (the `exec` hands it the child's exit
+# status); backing off before exit gives the same effect as run-node2.cmd's
+# in-loop backoff, rather than exec'ing a missing file.
+if [[ ! -f "$exe" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] run.sh $channel: resolved binary '$exe' missing on disk — not exec'ing; backing off 60s before letting systemd restart" \
+        >> "$dir/koidra-diag.txt" 2>/dev/null || true
+    sleep 60
+    exit 1
+fi
+
 if [[ -n "${KOIDRA_MANIFEST_URL:-}" ]]; then
     exec "$exe" -c "$conf" -k "$authkey" \
         --listen-port "$port" --install-dir "$dir" \
