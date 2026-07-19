@@ -317,15 +317,25 @@ where
         //
         // Ask callers are unaffected: they receive the error through
         // [`Reply::to_result`] via their reply channel.
+        // warn!, not debug!: a dropped tell is a silently-lost recovery command
+        // (e.g. a watchdog `ForceRehome`) — it must be visible in default logs,
+        // with the message type so the lost command is identifiable.
         match self {
             Self::Forwarded(res) => {
                 if let Some(e) = res.into_any_err() {
-                    tracing::debug!(error = ?e, "forward failed; dropped on tell path");
+                    tracing::warn!(
+                        error = ?e,
+                        msg_type = type_name::<M>(),
+                        "forward failed; dropped on tell path"
+                    );
                 }
                 None
             }
             Self::ActorDead(_) | Self::NotFound(_) => {
-                tracing::debug!("forward to unavailable actor; dropped on tell path");
+                tracing::warn!(
+                    msg_type = type_name::<M>(),
+                    "forward to unavailable actor; dropped on tell path"
+                );
                 None
             }
         }
