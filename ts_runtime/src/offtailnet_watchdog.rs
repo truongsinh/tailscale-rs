@@ -40,7 +40,9 @@
 //! Ladder hygiene: the stall history is per-region — a fresh home region never
 //! inherits the previous region's strikes — and repeated `FullReset`s without recovery
 //! back off exponentially (up to 30 min) instead of churning control registration
-//! every few minutes on a box whose only reachable relay is dead.
+//! every few minutes on a box whose only reachable relay is dead. The backoff
+//! survives home-region flips (two dead regions alternating as home must not re-arm
+//! it per flip); only a genuinely stall-free window resets it.
 //!
 //! ## Hysteresis
 //!
@@ -352,6 +354,12 @@ struct WatchdogCore {
     /// Region of the most recent stall. A stall from a *different* region clears the
     /// history — a fresh home region must not inherit the previous region's strikes.
     last_stall_region: Option<RegionId>,
+    /// When the most recent stall (any region) was observed. Drives the sustained-
+    /// recovery reset of the FullReset backoff: only a genuinely stall-free window
+    /// re-arms it — a region *flip* does not, so two dead regions alternating as home
+    /// (A↔B ping-pong) cannot reset the backoff on every flip and churn control
+    /// registration each cycle.
+    last_stall_at: Option<Instant>,
     /// Consecutive control-stall `ForceReconnect` firings without an intervening
     /// [`StateUpdate`]. Drives the control-stall-not-fixed-by-reconnect escalation.
     consecutive_control_fires: u32,
@@ -371,6 +379,7 @@ impl WatchdogCore {
             rx_stalls: VecDeque::new(),
             stall_window,
             last_stall_region: None,
+            last_stall_at: None,
             consecutive_control_fires: 0,
             full_reset: FullResetBackoff::new(),
         }
@@ -393,19 +402,27 @@ impl WatchdogCore {
         region: RegionId,
         now: Instant,
     ) -> (usize, StallEscalation, Vec<Command>) {
-        if self.last_stall_region.is_some_and(|prev| prev != region) {
-            // Fresh home region: restart the ladder from the bottom.
-            self.rx_stalls.clear();
+        // Sustained recovery: a stall-free window (across ALL regions) restarts the
+        // ladder — including the FullReset backoff — from the bottom.
+        if self
+            .last_stall_at
+            .is_some_and(|last| now.saturating_duration_since(last) > self.stall_window)
+        {
             self.full_reset.reset();
+        }
+
+        if self.last_stall_region.is_some_and(|prev| prev != region) {
+            // Fresh home region: strikes restart from the bottom, so ForceRehome still
+            // fires per new region. The FullReset backoff deliberately SURVIVES the
+            // region change: with two dead regions the home flips A↔B on every forced
+            // re-home, and a per-flip backoff reset would re-arm FullReset each cycle
+            // (unbounded control churn while both relays stay dead).
+            self.rx_stalls.clear();
         }
         self.last_stall_region = Some(region);
+        self.last_stall_at = Some(now);
 
-        // Sustained recovery: if every previous strike aged out of the window, the
-        // ladder — including the FullReset backoff — restarts from the bottom.
-        if prune_and_count(&mut self.rx_stalls, now, self.stall_window) == 0 {
-            self.full_reset.reset();
-        }
-
+        prune_and_count(&mut self.rx_stalls, now, self.stall_window);
         self.rx_stalls.push_back(now);
         while self.rx_stalls.len() > STALL_HISTORY_CAP {
             self.rx_stalls.pop_front();
@@ -970,6 +987,49 @@ mod tests {
         c.on_rx_stall(region, t1 + secs(180));
         let (_, _, cmd) = c.on_rx_stall(region, t1 + secs(360));
         assert!(cmd.contains(&Command::ForceReconnect));
+    }
+
+    /// The two-dead-region flip cycle (A↔B, both one-way-dead, ~180s stall cadence):
+    /// each flip clears the strike history — so the ladder still walks Remeasure →
+    /// ForceRehome → FullReset per region — but the FullReset backoff must SURVIVE
+    /// the flips. Resetting it per region change (the old behavior) re-armed
+    /// FullReset every cycle, i.e. unbounded control churn while both relays stay
+    /// dead, and made the exponential schedule unreachable.
+    #[test]
+    fn full_reset_backoff_survives_dead_region_flip_cycle() {
+        let t0 = Instant::now();
+        let mut c = core(secs(180), DEFAULT_STALL_ESCALATION_WINDOW, t0);
+        let (a, b) = (r(1), r(2));
+
+        // Stall sequence: three per region, home flipping A→B→A on each ForceRehome.
+        let script: &[(u64, RegionId)] = &[
+            (180, a),
+            (360, a),
+            (540, a), // FullReset #1 fires; backoff 300s armed
+            (720, b),
+            (900, b),
+            (1080, b), // ladder reaches FullReset again ACROSS the flip; 540s ≥ 300s → fires
+            (1260, a),
+            (1440, a),
+            (1620, a), // FullReset stage, but 540s < 600s backoff → degrades
+            (1800, a), // 720s ≥ 600s → fires
+        ];
+
+        let mut reconnects = Vec::new();
+        let mut degraded_at = Vec::new();
+        for &(t, region) in script {
+            let (_, escalation, commands) = c.on_rx_stall(region, t0 + secs(t));
+            if commands.contains(&Command::ForceReconnect) {
+                reconnects.push(t);
+            } else if escalation == StallEscalation::FullReset {
+                // Backed off: still refreshes the penalty box, never touches control.
+                assert_eq!(commands, vec![Command::ForceRehome(Some(region))]);
+                degraded_at.push(t);
+            }
+        }
+
+        assert_eq!(reconnects, vec![540, 1080, 1800]);
+        assert_eq!(degraded_at, vec![1620]);
     }
 
     #[test]

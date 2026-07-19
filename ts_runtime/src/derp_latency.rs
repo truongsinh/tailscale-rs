@@ -37,8 +37,8 @@ pub struct Remeasure;
 /// exercise a different path than the DERP TCP relay return channel), so `avoid` puts the region
 /// in a **penalty box**: it is deprioritized in *every* subsequent home selection until either
 /// its TTL expires or positive health evidence ([`RxHealthyEvent`]) arrives — a different
-/// reachable region is selected if one exists; if the penalized region is the *only* reachable
-/// one, it is kept (a bad home beats no home).
+/// reachable region is selected if one exists; if every reachable region is penalized, the
+/// best-ranked one is kept (a bad home beats no home).
 #[derive(Copy, Clone, Debug)]
 pub struct ForceRehome {
     /// Region to move away from, if any.
@@ -59,11 +59,14 @@ struct HomeSelector {
     current_home: Option<RegionId>,
     /// When the home region last changed. Used for anti-flap hysteresis on lateral swaps.
     last_home_change: Option<Instant>,
-    /// Persistent penalty box (see [`ForceRehome`]). Unlike the previous one-shot design, this
-    /// survives every periodic remeasure for its TTL, so a dead relay that still answers
-    /// UDP/STUN latency probes cannot win the ranking back seconds after a forced swap
-    /// (the re-home ping-pong failure mode).
-    penalty: Option<PenaltyBox>,
+    /// Persistent penalty box (see [`ForceRehome`]): one entry per penalized region, each with
+    /// its own TTL. Holding *multiple* regions at once matters: with two dead-but-STUN-answering
+    /// regions outranking a healthy third, a single-slot box lets the second `ForceRehome`
+    /// overwrite the first region's penalty — the node then ping-pongs between the two dead
+    /// relays forever and never reaches the healthy one. Bounded at
+    /// [`Self::MAX_PENALIZED_REGIONS`]; inserting past the cap evicts the entry expiring
+    /// soonest (bounded growth, crash-proof invariant).
+    penalties: Vec<PenaltyBox>,
     /// Pending one-shot hysteresis override, timestamped so it expires instead of parking
     /// forever when no derp map is retained at request time.
     force_rehome_at: Option<Instant>,
@@ -82,34 +85,63 @@ impl HomeSelector {
     /// re-homes immediately, regardless of this floor.
     const HOME_HYSTERESIS: Duration = Duration::from_secs(45);
 
+    /// Hard cap on concurrently penalized regions (bounded growth). Four covers every
+    /// observed field topology (2–3 candidate regions) with margin; past the cap the
+    /// entry expiring soonest is evicted.
+    const MAX_PENALIZED_REGIONS: usize = 4;
+
     fn new(avoid_ttl: Duration) -> Self {
         Self {
             current_home: None,
             last_home_change: None,
-            penalty: None,
+            penalties: Vec::new(),
             force_rehome_at: None,
             avoid_ttl,
         }
     }
 
-    /// Record a forced re-home request: penalize `avoid` (if any) for the TTL and arm the
-    /// one-shot hysteresis override.
+    /// Record a forced re-home request: penalize `avoid` (if any) for the TTL — alongside any
+    /// previously penalized regions, so two dead relays cannot alternately evict each other's
+    /// penalty (the multi-dead-region ping-pong) — and arm the one-shot hysteresis override.
     fn force_rehome(&mut self, avoid: Option<RegionId>, now: Instant) {
         if let Some(region) = avoid {
             match now.checked_add(self.avoid_ttl) {
-                Some(until) => self.penalty = Some(PenaltyBox { region, until }),
+                Some(until) => {
+                    if let Some(existing) =
+                        self.penalties.iter_mut().find(|p| p.region == region)
+                    {
+                        existing.until = until;
+                    } else {
+                        if self.penalties.len() >= Self::MAX_PENALIZED_REGIONS
+                            && let Some(oldest) = self
+                                .penalties
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, p)| p.until)
+                                .map(|(i, _)| i)
+                        {
+                            let evicted = self.penalties.swap_remove(oldest);
+                            tracing::warn!(
+                                region = %evicted.region,
+                                "penalty box full; evicting soonest-expiring entry"
+                            );
+                        }
+                        self.penalties.push(PenaltyBox { region, until });
+                    }
+                }
                 None => tracing::warn!(%region, "avoid TTL overflows the clock; not penalizing"),
             }
         }
         self.force_rehome_at = Some(now);
     }
 
-    /// Positive health evidence for `region` (frames arriving on a home connection to it):
+    /// Positive health evidence for `region` (frames arriving on a connection to it):
     /// clear its penalty early. Returns whether a penalty was cleared.
     fn on_region_healthy(&mut self, region: RegionId, _now: Instant) -> bool {
-        if self.penalty.is_some_and(|p| p.region == region) {
+        let before = self.penalties.len();
+        self.penalties.retain(|p| p.region != region);
+        if self.penalties.len() != before {
             tracing::info!(%region, "penalized region delivering frames again; clearing penalty box early");
-            self.penalty = None;
             return true;
         }
         false
@@ -130,15 +162,16 @@ impl HomeSelector {
             None => false,
         };
 
-        if let Some(p) = self.penalty
-            && now >= p.until
-        {
-            tracing::info!(region = %p.region, "re-home penalty box TTL expired; region eligible again");
-            self.penalty = None;
-        }
-        let avoid = self.penalty.map(|p| p.region);
+        self.penalties.retain(|p| {
+            let expired = now >= p.until;
+            if expired {
+                tracing::info!(region = %p.region, "re-home penalty box TTL expired; region eligible again");
+            }
+            !expired
+        });
 
-        let best = select_best(results, avoid);
+        let avoid: Vec<RegionId> = self.penalties.iter().map(|p| p.region).collect();
+        let best = select_best(results, &avoid);
         let current_reachable = self
             .current_home
             .map(|cur| results.iter().any(|r| r.id == cur))
@@ -227,18 +260,16 @@ impl DerpLatencyMeasurer {
     }
 }
 
-/// Pick the best (lowest-latency) region, deprioritizing `avoid`: the best non-avoided region
-/// wins; if the avoided region is the only one measured reachable, fall back to it — a bad home
-/// still beats no home. Pure (no I/O, no clock) so it can be unit-tested in isolation.
-fn select_best(results: &[RegionResult], avoid: Option<RegionId>) -> Option<RegionId> {
-    match avoid {
-        Some(a) => results
-            .iter()
-            .find(|r| r.id != a)
-            .or(results.first())
-            .map(|r| r.id),
-        None => results.first().map(|r| r.id),
-    }
+/// Pick the best (lowest-latency) region, deprioritizing every region in `avoid`: the best
+/// non-avoided region wins; if *every* measured region is avoided, fall back to the best-ranked
+/// one — a bad home still beats no home. Pure (no I/O, no clock) so it can be unit-tested in
+/// isolation.
+fn select_best(results: &[RegionResult], avoid: &[RegionId]) -> Option<RegionId> {
+    results
+        .iter()
+        .find(|r| !avoid.contains(&r.id))
+        .or(results.first())
+        .map(|r| r.id)
 }
 
 /// Pure home-selection decision (no I/O, no clock) so it can be unit-tested in isolation.
@@ -407,23 +438,33 @@ mod tests {
 
     #[test]
     fn select_best_takes_lowest_latency_without_avoid() {
-        assert_eq!(select_best(&results(&[1, 2, 3]), None), Some(r(1)));
-        assert_eq!(select_best(&results(&[]), None), None);
+        assert_eq!(select_best(&results(&[1, 2, 3]), &[]), Some(r(1)));
+        assert_eq!(select_best(&results(&[]), &[]), None);
     }
 
     #[test]
     fn select_best_skips_avoided_region() {
         // Forced re-home away from a one-way-dead relay: the stalled region may still
         // answer latency probes, so it must be actively deprioritized.
-        assert_eq!(select_best(&results(&[1, 2, 3]), Some(r(1))), Some(r(2)));
-        assert_eq!(select_best(&results(&[1, 2, 3]), Some(r(2))), Some(r(1)));
+        assert_eq!(select_best(&results(&[1, 2, 3]), &[r(1)]), Some(r(2)));
+        assert_eq!(select_best(&results(&[1, 2, 3]), &[r(2)]), Some(r(1)));
     }
 
     #[test]
-    fn select_best_falls_back_to_avoided_when_it_is_the_only_region() {
+    fn select_best_skips_every_avoided_region() {
+        // TWO dead-but-probe-answering regions outranking a healthy third: both must
+        // be deprioritized simultaneously, or the node ping-pongs between the dead
+        // pair and never reaches the healthy region.
+        assert_eq!(select_best(&results(&[1, 2, 3]), &[r(1), r(2)]), Some(r(3)));
+        assert_eq!(select_best(&results(&[1, 2, 3]), &[r(2), r(3)]), Some(r(1)));
+    }
+
+    #[test]
+    fn select_best_falls_back_to_best_ranked_when_all_regions_avoided() {
         // A bad home still beats no home — never strand the node without a relay.
-        assert_eq!(select_best(&results(&[1]), Some(r(1))), Some(r(1)));
-        assert_eq!(select_best(&results(&[]), Some(r(1))), None);
+        assert_eq!(select_best(&results(&[1]), &[r(1)]), Some(r(1)));
+        assert_eq!(select_best(&results(&[1, 2]), &[r(1), r(2)]), Some(r(1)));
+        assert_eq!(select_best(&results(&[]), &[r(1)]), None);
     }
 
     #[test]
@@ -548,6 +589,84 @@ mod tests {
         // Region 1 is immediately eligible again (hysteresis elapsed: last change t0).
         assert_eq!(
             sel.select_home(&results(&[1, 2]), t0 + secs(120)),
+            Some(r(1))
+        );
+    }
+
+    /// The multi-dead-region ping-pong: dead-but-STUN-answering A and B outrank
+    /// healthy C. A single-slot penalty let ForceRehome(avoid B) overwrite A's
+    /// penalty → A↔B forever, C never selected. The map must hold both.
+    #[test]
+    fn two_dead_regions_ping_pong_settles_on_healthy_third() {
+        let t0 = Instant::now();
+        let mut sel = HomeSelector::new(TTL);
+        assert_eq!(sel.select_home(&results(&[1, 2, 3]), t0), Some(r(1)));
+
+        // A stalls repeatedly → forced off A, onto B.
+        sel.force_rehome(Some(r(1)), t0 + secs(60));
+        assert_eq!(
+            sel.select_home(&results(&[1, 2, 3]), t0 + secs(60)),
+            Some(r(2))
+        );
+
+        // B is dead too → forced off B. A's penalty must SURVIVE: the healthy
+        // third region wins — not a flip back to dead A.
+        sel.force_rehome(Some(r(2)), t0 + secs(120));
+        assert_eq!(
+            sel.select_home(&results(&[1, 2, 3]), t0 + secs(120)),
+            Some(r(3))
+        );
+
+        // Every 30s remeasure for the remainder of both TTLs stays on C.
+        let mut t = t0 + secs(150);
+        while t < t0 + secs(60) + TTL {
+            assert_eq!(
+                sel.select_home(&results(&[1, 2, 3]), t),
+                Some(r(3)),
+                "must stay on the healthy region at t0+{:?}",
+                t.duration_since(t0)
+            );
+            t += secs(30);
+        }
+    }
+
+    #[test]
+    fn penalties_expire_per_entry_not_as_a_block() {
+        let t0 = Instant::now();
+        let mut sel = HomeSelector::new(TTL);
+        sel.force_rehome(Some(r(1)), t0);
+        sel.force_rehome(Some(r(2)), t0 + secs(300));
+
+        // Between A's expiry and B's: A is eligible again, B still avoided.
+        let t = t0 + TTL + secs(30);
+        assert_eq!(sel.select_home(&results(&[2, 1]), t), Some(r(1)));
+    }
+
+    #[test]
+    fn re_penalizing_a_region_refreshes_its_ttl_without_duplicates() {
+        let t0 = Instant::now();
+        let mut sel = HomeSelector::new(TTL);
+        sel.force_rehome(Some(r(1)), t0);
+        sel.force_rehome(Some(r(1)), t0 + secs(300));
+        assert_eq!(sel.penalties.len(), 1);
+
+        // Past the original TTL but inside the refreshed one: still avoided.
+        let t = t0 + TTL + secs(30);
+        assert_eq!(sel.select_home(&results(&[1, 2]), t), Some(r(2)));
+    }
+
+    #[test]
+    fn penalty_map_is_capped_and_evicts_the_soonest_expiring_entry() {
+        let t0 = Instant::now();
+        let mut sel = HomeSelector::new(TTL);
+        for (i, n) in [1u32, 2, 3, 4, 5].into_iter().enumerate() {
+            sel.force_rehome(Some(r(n)), t0 + secs(i as u64));
+        }
+        assert_eq!(sel.penalties.len(), HomeSelector::MAX_PENALIZED_REGIONS);
+
+        // Region 1 (soonest-expiring) was evicted → eligible again; 2–5 still boxed.
+        assert_eq!(
+            sel.select_home(&results(&[2, 3, 4, 5, 1]), t0 + secs(10)),
             Some(r(1))
         );
     }
