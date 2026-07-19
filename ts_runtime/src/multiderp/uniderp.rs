@@ -1281,6 +1281,28 @@ mod tests {
         }
     }
 
+    /// Transport whose `send` never completes — the wedged-TCP-write-path field mode
+    /// (relay stops ACKing, send buffer full) — and whose `recv` never yields.
+    struct WedgedSendTransport;
+
+    impl UnderlayTransport for WedgedSendTransport {
+        type PeerKey = PeerId;
+        type Error = ts_derp::Error;
+
+        async fn send(
+            &self,
+            _packet_batch: impl BatchSendIter<Self::PeerKey>,
+        ) -> Result<(), Self::Error> {
+            core::future::pending::<()>().await;
+            Ok(())
+        }
+
+        async fn recv(&self) -> impl BatchRecvIter<Self::PeerKey, Error = Self::Error> {
+            core::future::pending::<()>().await;
+            Vec::<Result<(PeerId, Vec<PacketMut>), ts_derp::Error>>::new()
+        }
+    }
+
     /// Bus probe capturing rx-stall / rx-healthy events into channels.
     struct BusProbe {
         stall_tx: mpsc::UnboundedSender<RxStallEvent>,
@@ -1421,12 +1443,42 @@ mod tests {
         assert!(ret.is_ok());
     }
 
+    /// A forever-pending send with a short injected timeout must recycle the
+    /// connection via an `Ok` return (run() reconnects) — and must NOT publish a
+    /// stall event: a wedged tx path is a local recycle, not rx-stall evidence.
+    #[tokio::test]
+    async fn run_transport_recycles_wedged_send_without_stall_event() {
+        let mut h = harness(Duration::from_secs(300)).await;
+        h.runner.send_timeout = Duration::from_millis(50);
+        let frames = FrameActivity::default();
+
+        // One outbound packet triggers the send branch, which wedges forever.
+        h._from_dp_tx
+            .send((PeerId(1), vec![PacketMut::from(&b"payload"[..])]))
+            .expect("queue open");
+
+        let mut runner = h.runner;
+        let done =
+            tokio::spawn(async move { runner.run_transport(WedgedSendTransport, frames).await });
+
+        let ret = tokio::time::timeout(Duration::from_secs(5), done)
+            .await
+            .expect("send timeout must shed the wedged send well within bounds")
+            .expect("no panic");
+        assert!(ret.is_ok(), "recycle path returns Ok so run() reconnects");
+        assert!(
+            h.stall_rx.try_recv().is_err(),
+            "a wedged send is not rx-stall evidence"
+        );
+    }
+
     /// Keepalive-only frame arrival (never completing `transport.recv()`) must keep
     /// advancing the stall baseline — no stall while frames flow, positive-health
     /// evidence published once — and total silence afterwards must still fire.
+    /// (Threshold/cadence margin is 10x so scheduler hiccups can't flake this.)
     #[tokio::test]
     async fn run_transport_keepalives_advance_baseline_then_silence_fires() {
-        let mut h = harness(Duration::from_millis(500)).await;
+        let mut h = harness(Duration::from_secs(1)).await;
         let frames = FrameActivity::default();
         let feeder_frames = frames.clone();
 
