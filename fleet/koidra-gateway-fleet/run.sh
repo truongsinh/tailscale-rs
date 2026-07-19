@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
 #
-# Supervisor launch shim for koidra-gateway (Linux).
+# run.sh — koidra-gateway channel launch shim (Linux dev box).
 #
-# Invoked by the systemd unit (koidra-gateway-primary.service / -backup.service)
-# as:  run.sh <channel> <port> [exe-override]
+# Exec'd by the systemd unit (koidra-gateway-primary.service / -backup.service) as:
+#   run.sh <channel> <port> [exe-override]
+#     <channel>  = primary | backup
+#     <port>     = 2222 (primary) | 2223 (backup)   — dev ports
+#     [override] = optional explicit versioned binary name (rollout version pins)
 #
-# Mirror of run-node2.cmd: resolve exe name via override arg →
-# current-koidra-gateway.txt → default koidra_gateway-selfheal, then exec it.
 # `exec` replaces the shell so systemd's Restart=on-failure sees the binary's
 # exit status directly.
 #
-# $AUTHKEY, $KOIDRA_MANIFEST_URL are expected in the systemd unit's Environment=
-# lines. The channel's identity file is <channel>.json in this dir.
+# Binary resolution order (mirror of run-node2.cmd):
+#   1. exe-override arg ($3)
+#   2. current-koidra-gateway.txt — the authoritative pointer (versioned name,
+#      no .exe on Linux), seeded on deploy and rewritten by the updater
+#   3. default fallback = the shipped VERSIONED name (never a bare/self-heal
+#      name — keeps the running build obvious and rollback identity intact).
+#      Kept in sync with the installer's GW_SHA default / branch HEAD.
+#
+# Identity file is node-<channel>.json in this dir (dev keyfiles are
+# node-primary.json / node-backup.json — NOT <channel>.json).
+#
+# $AUTHKEY comes from the unit's Environment= (systemd env is process-private, so
+# baking it there is safe on Linux — unlike Windows machine env). $KOIDRA_MANIFEST_URL
+# is optional (the updater is off on the dev box during the roll).
 
 set -euo pipefail
 
@@ -20,22 +33,25 @@ channel="${1:?usage: run.sh <channel> <port> [exe-override]}"
 port="${2:?usage: run.sh <channel> <port> [exe-override]}"
 override="${3:-}"
 
-exe="$dir/koidra_gateway-selfheal"
+# Default = shipped versioned binary (matches installer GW_SHA default / HEAD).
+exe="$dir/koidra-gateway-06f9a3a"
 if [[ -f "$dir/current-koidra-gateway.txt" ]]; then
     target="$(head -n1 "$dir/current-koidra-gateway.txt" 2>/dev/null || true)"
-    if [[ -n "$target" ]]; then
-        exe="$dir/$target"
-    fi
+    [[ -n "$target" ]] && exe="$dir/$target"
 fi
-if [[ -n "$override" ]]; then
-    exe="$dir/$override"
-fi
+[[ -n "$override" ]] && exe="$dir/$override"
+
+# Dev keyfiles are node-<channel>.json, not <channel>.json.
+conf="$dir/node-$channel.json"
+
+# Fail loudly (not a silent set -u abort) if the unit didn't bake the key.
+authkey="${AUTHKEY:?AUTHKEY not set — bake it into the unit Environment=}"
 
 if [[ -n "${KOIDRA_MANIFEST_URL:-}" ]]; then
-    exec "$exe" -c "$dir/$channel.json" -k "$AUTHKEY" \
+    exec "$exe" -c "$conf" -k "$authkey" \
         --listen-port "$port" --install-dir "$dir" \
         --manifest-url "$KOIDRA_MANIFEST_URL"
 else
-    exec "$exe" -c "$dir/$channel.json" -k "$AUTHKEY" \
+    exec "$exe" -c "$conf" -k "$authkey" \
         --listen-port "$port" --install-dir "$dir"
 fi

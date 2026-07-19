@@ -1,5 +1,21 @@
 #!/usr/bin/env bash
 #
+# ============================================================================
+# SUPERSEDED — DO NOT RUN. Kept for forensics only.
+#
+# This standalone migration script is retired. Its core design is `mv` of a
+# RUNNING install dir: the still-running sibling channel's unit ExecStart path
+# then vanishes, so its next restart can never come back (latent both-down —
+# the SSH-less-upgrade brick class). See review-persistence.md (H5) and
+# migration-plan.md §0.
+#
+# The dev box now migrates via the coordinator-driven staged sequence in
+# migration-plan.md §2.3 (COPY-and-stage beside the old dir, self-contained new
+# units, external validation, deferred cleanup) using the checked-in
+# koidra-gateway-{primary,backup}.service templates. This file is retained ONLY
+# so the old approach and its defects remain auditable.
+# ============================================================================
+#
 # migrate-to-koidra-gateway.sh — one-shot rename of koidra-ssh → koidra-gateway
 # (Linux variant).
 #

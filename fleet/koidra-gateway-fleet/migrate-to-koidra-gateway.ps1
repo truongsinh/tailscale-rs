@@ -1,3 +1,21 @@
+# ============================================================================
+# SUPERSEDED — DO NOT RUN. Kept for forensics only.
+#
+# This standalone migration script is retired. Its core design is rename-in-place
+# (`Move-Item` a RUNNING install dir), which the charter forbids and which bricks
+# boxes; it also has a broken rollback (`schtasks /create /xml -` does not accept
+# stdin), a guaranteed-false health gate (matches `koidra_gateway` underscore vs
+# the renamed `koidra-gateway-*` hyphen), never migrates the baked auth key, and
+# uses PS3+ `Get-CimInstance` on PS2.0 Win7 boxes. See review-persistence.md (C3,
+# H5, M4) and migration-plan.md §0.
+#
+# The SOLE migration vehicle is now the identity-preserving two-phase installer
+# (installer.nsi → koidra-gateway-setup.exe): COPY-and-stage beside the old dir,
+# start new, coordinator external validation, then `/FINALIZE` to remove old
+# persistence. See README.md. This file is retained ONLY so the old approach and
+# its defects remain auditable.
+# ============================================================================
+
 # migrate-to-koidra-gateway.ps1 — one-shot rename of koidra-ssh → koidra-gateway.
 #
 # CANARY-SAFE SEQUENCE (backup channel first, primary never touched until
