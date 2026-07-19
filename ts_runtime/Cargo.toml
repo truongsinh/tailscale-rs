@@ -48,6 +48,10 @@ proptest.workspace = true
 rand.workspace = true
 tokio-test = "0.4"
 ts_capabilityversion.workspace = true
+# The in-process FakeServer harness, so integration tests can run a REAL derp
+# client (true handshake + frame codec + keepalive accounting) through the
+# transport loop.
+ts_derp = { workspace = true, features = ["test-util"] }
 
 [features]
 console = ["kameo/console"]

@@ -12,6 +12,8 @@ mod client;
 pub mod dial;
 mod error;
 pub mod frame;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 
 pub use client::{Client, DefaultClient, FrameActivity};
 pub use error::Error;

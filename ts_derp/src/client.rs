@@ -14,7 +14,9 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use ts_http_util::Client as _;
 use ts_keys::{NodeKeyPair, NodePublicKey};
 use ts_packet::PacketMut;
-use ts_transport::{BatchRecvIter, BatchSendIter, UnderlayTransport};
+use ts_transport::{
+    BatchRecvIter, BatchSendIter, MapPeerKey, PeerLookup, UnderlayTransport, UnderlayTransportExt,
+};
 use url::Url;
 
 use crate::{
@@ -157,8 +159,34 @@ where
     /// [`ts_transport::UnderlayTransportExt::with_key_lookup`]), so callers can observe
     /// frame arrival — keepalives included — without changing the peer-data semantics
     /// of [`UnderlayTransport::recv`].
+    ///
+    /// Callers wrapping the client into a peer-keyed transport should prefer
+    /// [`Self::into_transport_with_activity`], which yields the transport and the
+    /// handle **together** so the two can never come from different clients.
     pub fn frame_activity(&self) -> FrameActivity {
         self.frame_activity.clone()
+    }
+
+    /// Consume the client into a peer-keyed transport plus **its own**
+    /// frame-arrival handle.
+    ///
+    /// The two are constructed together, in one place, from one client — so a
+    /// stall detector observing the handle while polling the transport can never
+    /// be wired to a handle belonging to a different (or freshly defaulted)
+    /// client. That wrong-handle bug would leave every healthy connection looking
+    /// frame-silent (all keepalives invisible) and false-fire stall detection on
+    /// the entire fleet; making it unrepresentable is the point of this API.
+    pub fn into_transport_with_activity<DstKey, Lookup>(
+        self,
+        lookup: Lookup,
+    ) -> (MapPeerKey<Self, Lookup, DstKey>, FrameActivity)
+    where
+        Io: Send,
+        Lookup: PeerLookup<NodePublicKey, DstKey> + PeerLookup<DstKey, NodePublicKey> + Send + Sync,
+        DstKey: Send + Sync + 'static,
+    {
+        let frames = self.frame_activity.clone();
+        (self.with_key_lookup(lookup), frames)
     }
 
     /// Send a message to a nodekey on the derp server.
@@ -355,78 +383,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    #![allow(deprecated)] // KeepAlive frames are exactly what we are testing.
-
     use std::{sync::Arc, time::Duration};
 
-    use crypto_box::aead::{Aead, AeadCore, OsRng};
-    use futures::{SinkExt, StreamExt};
-    use tokio::io::{AsyncRead, AsyncWrite};
-    use tokio_util::codec::{FramedRead, FramedWrite};
-
     use super::Client;
-    use crate::frame::{self, KeepAlive, Magic, RawFrame, RecvPacket, ServerInfo, ServerKey};
-
-    /// Minimal in-process DERP "server" end of a duplex pipe: performs the real
-    /// handshake wire exchange so [`Client::handshake`] runs its true code path.
-    struct FakeServer<Io> {
-        fw: FramedWrite<tokio::io::WriteHalf<Io>, frame::Codec>,
-        /// Kept alive so the client's own writes (e.g. Pong replies) stay deliverable.
-        _fr: FramedRead<tokio::io::ReadHalf<Io>, frame::Codec>,
-    }
-
-    impl<Io: AsyncRead + AsyncWrite> FakeServer<Io> {
-        async fn handshake(io: Io, client_public: &ts_keys::NodePublicKey) -> Self {
-            let (r, w) = tokio::io::split(io);
-            let mut fw = FramedWrite::new(w, frame::Codec);
-            let mut fr = FramedRead::new(r, frame::Codec);
-
-            let secret = crypto_box::SecretKey::generate(&mut OsRng);
-            let server_key = ServerKey {
-                magic: Magic::MAGIC,
-                key: (*secret.public_key().as_bytes()).into(),
-            };
-            fw.send(RawFrame::from_body(&server_key, 0).unwrap())
-                .await
-                .unwrap();
-
-            // Consume the ClientInfo frame; its contents are irrelevant here.
-            fr.next().await.unwrap().unwrap();
-
-            let cbox = crypto_box::SalsaBox::new(&client_public.into(), &secret);
-            let nonce = crypto_box::SalsaBox::generate_nonce(&mut OsRng);
-            let payload = serde_json::to_vec(&serde_json::json!({ "version": 2 })).unwrap();
-            let encrypted = cbox.encrypt(&nonce, &payload[..]).unwrap();
-            let si = ServerInfo {
-                nonce: nonce.into(),
-            };
-            fw.send((
-                RawFrame::from_body(&si, encrypted.len()).unwrap(),
-                encrypted.as_ref(),
-            ))
-            .await
-            .unwrap();
-
-            Self { fw, _fr: fr }
-        }
-
-        async fn send_keepalive(&mut self) {
-            self.fw
-                .send(RawFrame::from_body(&KeepAlive, 0).unwrap())
-                .await
-                .unwrap();
-        }
-
-        async fn send_peer_packet(&mut self, src: ts_keys::NodePublicKey, payload: &[u8]) {
-            self.fw
-                .send((
-                    RawFrame::from_body(&RecvPacket { src }, payload.len()).unwrap(),
-                    payload,
-                ))
-                .await
-                .unwrap();
-        }
-    }
+    use crate::test_util::FakeServer;
 
     async fn wait_for(mut cond: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -482,12 +442,7 @@ mod tests {
         assert_eq!(activity.frames_received(), 3);
 
         // A subsequent Ping is answered with a Pong and also advances the signal.
-        let ping = frame::Ping { payload: [7u8; 8] };
-        server
-            .fw
-            .send(RawFrame::from_body(&ping, 0).unwrap())
-            .await
-            .unwrap();
+        server.send_ping([7u8; 8]).await;
         let recv_task = tokio::spawn({
             let client = client.clone();
             async move { client.recv_one().await }

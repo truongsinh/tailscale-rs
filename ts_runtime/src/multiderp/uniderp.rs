@@ -16,9 +16,7 @@ use ts_dataplane::async_tokio::{FromUnderlay, Rx, ToUnderlay, Tx};
 use ts_derp::RegionId;
 use ts_keys::{NodeKeyPair, NodePublicKey};
 use ts_packet::PacketMut;
-use ts_transport::{
-    BatchRecvIter, PeerId, UnderlayTransport, UnderlayTransportExt, UnderlayTransportId,
-};
+use ts_transport::{BatchRecvIter, PeerId, UnderlayTransport, UnderlayTransportId};
 
 use crate::{
     Task,
@@ -604,11 +602,12 @@ impl Runner {
         tracing::trace!("establishing derp connection");
 
         let client = ts_derp::DefaultClient::connect(&self.region.servers, &self.keys).await?;
-        // Grab the frame-arrival signal before the client is wrapped: it advances on
-        // every DERP frame (keepalives included), which is the input to the
-        // frame-silence stall predicate.
-        let frames = client.frame_activity();
-        let transport = client.with_key_lookup(PeerDbLookup(self.peer_db.clone()));
+        // Transport and frame-arrival signal are constructed TOGETHER from the same
+        // client: the signal advances on every DERP frame (keepalives included) —
+        // the input to the frame-silence stall predicate — and the coupled API makes
+        // wiring the tracker to a foreign/fresh handle unrepresentable.
+        let (transport, frames) =
+            client.into_transport_with_activity(PeerDbLookup(self.peer_db.clone()));
 
         if let Some(pending) = pending {
             tracing::trace!("sending queued packet");
@@ -1512,6 +1511,72 @@ mod tests {
         let evt = tokio::time::timeout(Duration::from_secs(10), h.stall_rx.recv())
             .await
             .expect("stall after frames stop")
+            .expect("bus probe alive");
+        assert_eq!(evt.region_id, h.region_id);
+
+        let ret = tokio::time::timeout(Duration::from_secs(5), done)
+            .await
+            .expect("run_transport returns after stall")
+            .expect("no panic");
+        assert!(ret.is_ok());
+    }
+
+    /// Client→runtime wiring seam, exercised end-to-end with a REAL derp client:
+    /// true handshake, true frame codec, true keepalive accounting — wired through
+    /// [`ts_derp::Client::into_transport_with_activity`] exactly as `connect()`
+    /// does. While the fake server's keepalives flow, the loop must publish
+    /// positive-health evidence and hold off the stall predicate — which only
+    /// happens when the tracker observes the SAME [`FrameActivity`] the client
+    /// increments. A decoupled or freshly-defaulted handle (the mutation-D bug:
+    /// every healthy conn false-fires in production) fails this test on both
+    /// counts. Silence afterwards must still fire and recycle.
+    #[tokio::test]
+    async fn run_transport_with_real_client_sees_its_keepalives_then_silence_fires() {
+        let mut h = harness(Duration::from_secs(1)).await;
+        let keys = h.runner.keys.clone();
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let (client, mut server) = tokio::join!(
+            async {
+                ts_derp::Client::handshake(client_io, &keys)
+                    .await
+                    .expect("client handshake")
+            },
+            ts_derp::test_util::FakeServer::handshake(server_io, &keys.public),
+        );
+
+        let (transport, frames) =
+            client.into_transport_with_activity(super::PeerDbLookup(h.runner.peer_db.clone()));
+
+        let mut runner = h.runner;
+        let done = tokio::spawn(async move { runner.run_transport(transport, frames).await });
+
+        // Real server keepalives every 100ms for 1.5s (10x margin vs the 1s
+        // threshold). The server is returned so the pipe stays open — dropping it
+        // would EOF the client and exit the loop via recv error, not the stall.
+        let feeder = tokio::spawn(async move {
+            for _ in 0..15u32 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                server.send_keepalive().await;
+            }
+            server
+        });
+
+        let healthy = tokio::time::timeout(Duration::from_secs(5), h.healthy_rx.recv())
+            .await
+            .expect("healthy event while real keepalives flow")
+            .expect("bus probe alive");
+        assert_eq!(healthy.region_id, h.region_id);
+
+        let _server = feeder.await.expect("feeder");
+        assert!(
+            h.stall_rx.try_recv().is_err(),
+            "no stall while the real client's keepalives were arriving"
+        );
+
+        // Server goes silent (pipe still open): the stall must fire and recycle.
+        let evt = tokio::time::timeout(Duration::from_secs(10), h.stall_rx.recv())
+            .await
+            .expect("stall after keepalives stop")
             .expect("bus probe alive");
         assert_eq!(evt.region_id, h.region_id);
 
