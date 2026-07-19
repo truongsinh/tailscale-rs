@@ -15,7 +15,7 @@ use kameo_actors::scheduler::SetTimeout;
 use ts_control::DerpRegion;
 use ts_derp::RegionId;
 use ts_transport::UnderlayTransportId;
-pub(crate) use uniderp::RxStallEvent;
+pub(crate) use uniderp::{RxHealthyEvent, RxStallConfig, RxStallEvent, jitter_seed, jittered};
 
 use crate::{Env, Error, multiderp::uniderp::Uniderp};
 
