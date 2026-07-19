@@ -53,13 +53,16 @@ pub struct RxStallEvent {
     pub pkts_sent_since_recv: u64,
 }
 
-/// Published on the bus (non-retained), at most once per connection, when a home derp
-/// connection observes DERP frames arriving — positive evidence that the region's
-/// return path works. [`crate::derp_latency::DerpLatencyMeasurer`] uses it to clear
-/// the forced-re-home penalty box early when the penalized region proves healthy.
+/// Published on the bus (non-retained), at most once per connection, when a derp
+/// connection — home or not — observes DERP frames arriving: positive evidence that
+/// the region's return path works. Health evidence is health evidence regardless of
+/// home status; a penalized region typically is NOT home (the penalty moved home
+/// elsewhere), so its cross-region connection is exactly where recovery shows first.
+/// [`crate::derp_latency::DerpLatencyMeasurer`] uses the event to clear the
+/// forced-re-home penalty box early when the penalized region proves healthy.
 #[derive(Clone, Debug)]
 pub struct RxHealthyEvent {
-    /// The region whose home connection delivered frames.
+    /// The region whose connection delivered frames.
     pub region_id: RegionId,
 }
 
@@ -246,11 +249,6 @@ impl RxStallTracker {
             self.pkts_sent_since_recv = 0;
         }
         self.is_home = is_home;
-    }
-
-    /// Whether this connection currently serves the home region.
-    pub fn is_home(&self) -> bool {
-        self.is_home
     }
 
     /// The smoking-gun predicate. Returns how long the connection has been
@@ -673,7 +671,11 @@ impl Runner {
                 from_derp = transport.recv() => {
                     last_activity = Instant::now();
                     let advanced = rx_stall.observe_frames(last_activity, frames.frames_received());
-                    if advanced && !health_published && rx_stall.is_home() {
+                    // Health evidence publishes from ANY conn (home or not): frames
+                    // arriving prove the region's return path regardless of home
+                    // status, and a penalized region is usually observed from a
+                    // non-home (cross-region) connection.
+                    if advanced && !health_published {
                         health_published = true;
                         if let Err(e) = self.env.publish_noretain(RxHealthyEvent {
                             region_id: self.region_id,
@@ -771,7 +773,7 @@ impl Runner {
                     }
 
                     let advanced = rx_stall.observe_frames(now, frames_now);
-                    if advanced && !health_published && rx_stall.is_home() {
+                    if advanced && !health_published {
                         health_published = true;
                         if let Err(e) = self.env.publish_noretain(RxHealthyEvent {
                             region_id: self.region_id,
@@ -1280,6 +1282,31 @@ mod tests {
         }
     }
 
+    /// Transport whose `recv` yields one EMPTY batch per wake-up message —
+    /// modelling frames that the derp client consumes inline (keepalives) or
+    /// batches that carry no peer data — and pends forever once the channel closes.
+    struct EmptyBatchOnDemand(Mutex<mpsc::UnboundedReceiver<()>>);
+
+    impl UnderlayTransport for EmptyBatchOnDemand {
+        type PeerKey = PeerId;
+        type Error = ts_derp::Error;
+
+        async fn send(
+            &self,
+            _packet_batch: impl BatchSendIter<Self::PeerKey>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn recv(&self) -> impl BatchRecvIter<Self::PeerKey, Error = Self::Error> {
+            let mut wake = self.0.lock().await;
+            if wake.recv().await.is_none() {
+                core::future::pending::<()>().await;
+            }
+            Vec::<Result<(PeerId, Vec<PacketMut>), ts_derp::Error>>::new()
+        }
+    }
+
     /// Transport whose `send` never completes — the wedged-TCP-write-path field mode
     /// (relay stops ACKing, send buffer full) — and whose `recv` never yields.
     struct WedgedSendTransport;
@@ -1471,6 +1498,63 @@ mod tests {
         );
     }
 
+    /// A NON-home connection observing frames must still publish health evidence
+    /// for its region — health is health regardless of home status, and a penalized
+    /// region's recovery is typically visible only from its cross-region (non-home)
+    /// connection — exactly once per connection, and must never publish a stall.
+    #[tokio::test]
+    async fn non_home_conn_publishes_health_evidence_once_for_its_region() {
+        let mut h = harness(Duration::from_secs(300)).await;
+        h._home_tx.send(false).expect("watch alive"); // NOT home for this whole test
+        let frames = FrameActivity::default();
+        let feeder_frames = frames.clone();
+        let (wake_tx, wake_rx) = mpsc::unbounded_channel();
+
+        let mut runner = h.runner;
+        let done = tokio::spawn(async move {
+            runner
+                .run_transport(EmptyBatchOnDemand(Mutex::new(wake_rx)), frames)
+                .await
+        });
+
+        // DERP frames arrive periodically on the non-home conn (cross-region peer
+        // relay traffic). Periodic — not one-shot — so the first record can never
+        // race the tracker's baseline capture inside the spawned loop.
+        let feeder = tokio::spawn(async move {
+            for _ in 0..30u32 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                feeder_frames.record();
+                if wake_tx.send(()).is_err() {
+                    break;
+                }
+            }
+            wake_tx // keep the wake channel open so recv pends instead of closing
+        });
+
+        let healthy = tokio::time::timeout(Duration::from_secs(5), h.healthy_rx.recv())
+            .await
+            .expect("health evidence from a non-home conn")
+            .expect("bus probe alive");
+        assert_eq!(healthy.region_id, h.region_id);
+
+        // Let the remaining frame advances play out: once-per-conn, no re-publish.
+        let _wake_tx = feeder.await.expect("feeder");
+
+        // Close the dataplane queue: run_transport exits cleanly (Ok).
+        drop(h._from_dp_tx);
+        let ret = tokio::time::timeout(Duration::from_secs(5), done)
+            .await
+            .expect("run_transport returns when the dataplane queue closes")
+            .expect("no panic");
+        assert!(ret.is_ok());
+
+        assert!(h.stall_rx.try_recv().is_err(), "non-home conn never stalls");
+        assert!(
+            h.healthy_rx.try_recv().is_err(),
+            "health evidence is once per connection"
+        );
+    }
+
     /// Keepalive-only frame arrival (never completing `transport.recv()`) must keep
     /// advancing the stall baseline — no stall while frames flow, positive-health
     /// evidence published once — and total silence afterwards must still fire.
@@ -1505,6 +1589,12 @@ mod tests {
         assert!(
             h.stall_rx.try_recv().is_err(),
             "no stall while frames were advancing"
+        );
+        // Once-per-connection: ~14 further frame advances after the first health
+        // publish must NOT re-publish — health evidence is per-conn, not per-frame.
+        assert!(
+            h.healthy_rx.try_recv().is_err(),
+            "no second RxHealthyEvent while frames keep advancing on the same conn"
         );
 
         // Frames stopped: silence must now be detected within ~2x threshold.

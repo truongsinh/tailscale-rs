@@ -374,6 +374,24 @@ impl Message<RxHealthyEvent> for DerpLatencyMeasurer {
     }
 }
 
+/// Test-only observation: which regions are currently penalty-boxed. Lets seam
+/// tests assert on selection state without a live derp map / netcheck.
+#[cfg(test)]
+pub(crate) struct PenalizedRegions;
+
+#[cfg(test)]
+impl Message<PenalizedRegions> for DerpLatencyMeasurer {
+    type Reply = Vec<RegionId>;
+
+    async fn handle(
+        &mut self,
+        _: PenalizedRegions,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.selector.penalties.iter().map(|p| p.region).collect()
+    }
+}
+
 impl Message<Arc<ts_control::StateUpdate>> for DerpLatencyMeasurer {
     type Reply = ();
 
@@ -713,5 +731,70 @@ mod tests {
         // The penalty must outlive the watchdog's stall-escalation window, or the node
         // can return to the dead relay mid-ladder and reset the escalation.
         assert!(DerpLatencyMeasurer::DEFAULT_AVOID_TTL >= Duration::from_secs(900));
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    //! The RxHealthyEvent→measurer seam, end-to-end: real [`Env`] bus, real
+    //! measurer actor, health evidence delivered as a bus publication. Dropping
+    //! the `subscribe::<RxHealthyEvent>` from `on_start` (mutation E) leaves every
+    //! pure test green while early penalty-clear is silently dead — this test is
+    //! the one that must fail.
+
+    use std::{num::NonZeroU32, time::Duration};
+
+    use kameo::actor::Spawn as _;
+    use ts_derp::RegionId;
+
+    use super::{DerpLatencyMeasurer, ForceRehome, PenalizedRegions};
+    use crate::{env::Env, multiderp::RxHealthyEvent};
+
+    fn r(n: u32) -> RegionId {
+        RegionId(NonZeroU32::new(n).unwrap())
+    }
+
+    #[tokio::test]
+    async fn rx_healthy_event_on_the_bus_clears_the_penalty_box() {
+        let env = Env::new(ts_keys::NodeState::generate());
+        let measurer = DerpLatencyMeasurer::spawn(env.clone());
+        env.wait::<DerpLatencyMeasurer>(None).await.unwrap();
+
+        // Penalize region 1 (no derp map retained, so the immediate re-measure is
+        // a no-op — the penalty persists regardless).
+        measurer
+            .ask(ForceRehome { avoid: Some(r(1)) })
+            .await
+            .expect("measurer alive");
+        assert_eq!(
+            measurer
+                .ask(PenalizedRegions)
+                .await
+                .expect("measurer alive"),
+            vec![r(1)]
+        );
+
+        // Health evidence arrives VIA THE BUS — the on_start subscription seam.
+        env.publish_noretain(RxHealthyEvent { region_id: r(1) })
+            .await
+            .expect("bus alive");
+
+        // Bus delivery is async: poll until the penalty clears (bounded).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if measurer
+                .ask(PenalizedRegions)
+                .await
+                .expect("measurer alive")
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "RxHealthyEvent never cleared the penalty — subscription seam broken"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
