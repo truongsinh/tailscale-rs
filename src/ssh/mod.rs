@@ -97,7 +97,7 @@ impl crate::Device {
             let conn = match listener.accept().await {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!(error = ?e, "ssh listener accept error; backing off");
+                    tracing::warn!(error = ?e, "gateway listener accept error; backing off");
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
