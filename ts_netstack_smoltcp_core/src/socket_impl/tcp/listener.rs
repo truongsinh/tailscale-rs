@@ -61,7 +61,7 @@ impl Netstack {
 
         match cmd {
             TcpListenCommand::Listen { local_endpoint } => {
-                let mut listener = tcp::Socket::new(self.tcp_buffer(), self.tcp_buffer());
+                let mut listener = tcp::Socket::new(self.tcp_rx_buffer(), self.tcp_tx_buffer());
 
                 if let Err(e) = listener.listen(local_endpoint) {
                     return Response::Error(e.into());
@@ -280,7 +280,8 @@ impl Netstack {
                     // Bound the half-open backlog. A flood of never-completed handshakes
                     // (connection churn, or clients that vanish mid-handshake) would otherwise
                     // grow `half_open_queue` — and the unbounded `socket_set` — without limit,
-                    // leaking two `tcp_buffer_size` buffers per SYN and slowing every
+                    // leaking a `tcp_rx_buffer_size` + `tcp_tx_buffer_size` buffer pair per SYN
+                    // and slowing every
                     // O(sockets) `poll_egress`. Reap the oldest half-open(s) beyond the cap,
                     // freeing their buffers immediately; a bounded backlog is the standard SYN
                     // defence and matches how a real OS accept queue drops the oldest pending
@@ -317,8 +318,8 @@ impl Netstack {
             // socket
 
             let mut new_listener = tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0; self.config.tcp_buffer_size]),
-                tcp::SocketBuffer::new(vec![0; self.config.tcp_buffer_size]),
+                tcp::SocketBuffer::new(vec![0; self.config.tcp_rx_buffer_size]),
+                tcp::SocketBuffer::new(vec![0; self.config.tcp_tx_buffer_size]),
             );
 
             if let Err(e) = new_listener.listen(listener.local_endpoint) {

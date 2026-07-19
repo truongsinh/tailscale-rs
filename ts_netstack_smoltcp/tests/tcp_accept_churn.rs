@@ -1,5 +1,5 @@
 //! A6/X3 harness (CI-only): rapid-connection-churn / half-open SYN-flood stress for the
-//! smoltcp netstack **accept path** at production config (`tcp_buffer_size = 16 KiB`,
+//! smoltcp netstack **accept path** at production config (`tcp_rx/tx buffers = 256 KiB`,
 //! `mtu = 1500` — exactly `netcore::Config::default()`, the config every deployed
 //! `ssh_shell` runs).
 //!
@@ -11,18 +11,18 @@
 //!
 //! Failure mode exercised (`ts_netstack_smoltcp_core/src/socket_impl/tcp/listener.rs`):
 //!   * Before the fix, `pump_tcp_accept` pushed every `SYN-RECEIVED` socket onto
-//!     `half_open_queue` and minted a fresh 32 KiB listen socket — but NEVER reaped that
+//!     `half_open_queue` and minted a fresh 512 KiB listen socket — but NEVER reaped that
 //!     queue. The only place it was serviced is inside `process_tcp_listen(Accept)`, and
 //!     there a socket still stuck in `SYN-RECEIVED` is re-queued forever: there was no
 //!     age-out / timeout / backlog cap.
 //!   * Consequences of the unbounded backlog: (a) each half-open connection permanently
-//!     leaked a `socket_set` slot + two 16 KiB buffers (32 KiB); (b) `socket_set` is a
+//!     leaked a `socket_set` slot + a 256 KiB + 256 KiB buffer pair (512 KiB); (b) `socket_set` is a
 //!     plain `Vec` (`SocketSet::new(vec![])`, `lib.rs:111`) so `poll_egress` — which is
 //!     O(sockets) and runs on every netstack poll — degraded without bound; (c) with an
 //!     accept outstanding (the real `ssh_shell` server is ALWAYS mid-`accept`), every wake
 //!     re-scanned the whole `half_open_queue`.
 //!   * The fix caps the backlog: `pump_tcp_accept` reaps the oldest half-open(s) once
-//!     `half_open_queue` exceeds `config.tcp_half_open_backlog` (default 256), and the
+//!     `half_open_queue` exceeds `config.tcp_half_open_backlog` (default 32), and the
 //!     `accept()` terminal-state arm `remove`s sockets that leave the half-open lifecycle,
 //!     bounding a listener's half-open footprint regardless of flood size.
 //!
@@ -31,7 +31,7 @@
 //!     the listener from accepting a subsequent real connection.
 //!   * `half_open_flood_stays_within_bounded_backlog` — the discriminating repro at scale,
 //!     measuring process RSS: with the backlog cap, 20 000 half-opens retain only a bounded
-//!     fraction; without it they retain ~32 KiB each. GREEN with the reaper/cap in place,
+//!     fraction; without it they retain ~512 KiB each. GREEN with the reaper/cap in place,
 //!     RED (leak reproduced) if it is reverted — so this test gates the churn fix.
 
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -164,10 +164,12 @@ async fn complete_handshake(
             .recv_async()
             .await
             .ok_or("wire closed before probe SYN-ACK")?;
-        if let Some(seg) = parse_segment(&pkt) {
-            if seg.dst_port == probe_port && seg.syn && seg.ack {
-                break seg.seq;
-            }
+        if let Some(seg) = parse_segment(&pkt)
+            && seg.dst_port == probe_port
+            && seg.syn
+            && seg.ack
+        {
+            break seg.seq;
         }
     };
 
@@ -237,7 +239,7 @@ async fn accept_survives_light_half_open_churn() -> common::Result<()> {
 ///
 /// Floods the listener with a large number of half-open connections — SYNs that never
 /// complete their handshake. Each drives the listen socket to `SYN-RECEIVED`, so
-/// `pump_tcp_accept` pushes it onto `half_open_queue` (with its two 16 KiB buffers) and
+/// `pump_tcp_accept` pushes it onto `half_open_queue` (with its 256 KiB + 256 KiB buffers) and
 /// mints a fresh listen socket. With the fix, `pump_tcp_accept` reaps the oldest half-open
 /// once the queue exceeds `config.tcp_half_open_backlog`, and `accept()` `remove`s sockets
 /// that leave the half-open lifecycle — so the retained footprint is bounded. Without the
@@ -247,8 +249,8 @@ async fn accept_survives_light_half_open_churn() -> common::Result<()> {
 ///
 /// The test measures process RSS: with the cap, a flood of `FLOOD` half-opens retains only
 /// a small, bounded fraction; without it each of the `FLOOD` sockets permanently retains
-/// ~32 KiB and `accept()` frees none of it. The assertion encodes the healthy (bounded)
-/// contract — GREEN with the reaper/cap, RED (leak reproduced, ~`FLOOD * 32 KiB` retained)
+/// ~512 KiB and `accept()` frees none of it. The assertion encodes the healthy (bounded)
+/// contract — GREEN with the reaper/cap, RED (leak reproduced, ~`FLOOD * 512 KiB` retained)
 /// if the backlog cap is reverted, so it gates the churn fix.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -263,9 +265,9 @@ async fn half_open_flood_stays_within_bounded_backlog() -> common::Result<()> {
 
     let listener = server.tcp_listen(server_endpoint()).await?;
 
-    // Each retained SYN-RECEIVED socket holds two 16 KiB smoltcp buffers.
+    // Each retained SYN-RECEIVED socket holds a 256 KiB rx + 256 KiB tx smoltcp buffer.
     const FLOOD: u32 = 20_000;
-    const PER_SOCKET: u64 = 32 * 1024;
+    const PER_SOCKET: u64 = 512 * 1024;
 
     let rss_before = rss_bytes();
 

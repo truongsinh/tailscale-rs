@@ -1,5 +1,5 @@
 //! Heavy-transfer stress harness for the netstack TCP bridge at **production config** —
-//! `tcp_buffer_size = 16 KiB`, `mtu = 1500` (exactly `netcore::Config::default()`, the
+//! `tcp_rx/tx buffers = 256 KiB`, `mtu = 1500` (exactly `netcore::Config::default()`, the
 //! config every deployed `ssh_shell` runs). Reproduces the field-reported "connection
 //! with heavy transfer wedges" symptom.
 //!
@@ -46,8 +46,8 @@ fn payload(len: usize) -> Vec<u8> {
 async fn bulk_transfer_preserves_every_byte() -> common::Result<()> {
     common::init();
 
-    // one 16 KiB buffer · 4 refills · 16 refills (many 1500-byte segments)
-    for &size in &[16 * 1024usize, 64 * 1024, 256 * 1024] {
+    // sub-buffer · fills the 256 KiB buffer exactly · overflows it (many 1500-byte segments)
+    for &size in &[16 * 1024usize, 256 * 1024, 1024 * 1024] {
         let (stack1, stack2) = common::spawn_piped_netstacks(Default::default(), None).await?;
         let listener = stack2.tcp_listen(common::netstack2_endpoint()).await?;
 
@@ -55,7 +55,7 @@ async fn bulk_transfer_preserves_every_byte() -> common::Result<()> {
         let to_send = expected.clone();
 
         // Writer: accept, stream the whole payload, then drop the socket. `write_all` for a
-        // payload larger than the 16 KiB send buffer only completes once the reader drains,
+        // payload larger than the 256 KiB send buffer only completes once the reader drains,
         // so completion proves back-pressure worked; the drop issues Close → graceful FIN.
         let writer = tokio::spawn(async move {
             let mut sock = listener.accept().await.unwrap();
@@ -100,7 +100,7 @@ async fn bulk_transfer_preserves_every_byte() -> common::Result<()> {
 async fn bidirectional_heavy_transfer_preserves_every_byte() -> common::Result<()> {
     common::init();
 
-    const SIZE: usize = 256 * 1024; // 16 buffer-refills each way
+    const SIZE: usize = 1024 * 1024; // 4 refills of the 256 KiB buffer each way
 
     let (stack1, stack2) = common::spawn_piped_netstacks(Default::default(), None).await?;
     let listener = stack2.tcp_listen(common::netstack2_endpoint()).await?;

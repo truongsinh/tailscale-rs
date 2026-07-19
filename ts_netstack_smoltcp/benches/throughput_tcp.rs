@@ -32,7 +32,8 @@ async fn main() -> common::Result<()> {
 
     let (ch1, ch2) = common::spawn_piped_netstacks(
         ts_netstack_smoltcp_core::Config {
-            tcp_buffer_size: TCP_SOCKET_BUF_SIZE,
+            tcp_rx_buffer_size: TCP_SOCKET_BUF_SIZE,
+            tcp_tx_buffer_size: TCP_SOCKET_BUF_SIZE,
             command_channel_capacity: Some(128),
             mtu: usize::MAX,
             ..Default::default()
