@@ -29,6 +29,18 @@ pub struct DerpLatencyMeasurement {
 #[derive(Copy, Clone)]
 pub struct Remeasure;
 
+/// Force an immediate re-measure and re-home, overriding the anti-flap hysteresis for this one
+/// selection. Sent by the [`crate::offtailnet_watchdog::OffTailnetWatchdog`] when the home relay
+/// has repeatedly rx-stalled: the stalled region may still answer latency probes (UDP/STUN probes
+/// exercise a different path than the DERP TCP relay return channel), so `avoid` deprioritizes it
+/// — a different reachable region is selected if one exists; if the avoided region is the *only*
+/// reachable one, it is kept (a bad home beats no home).
+#[derive(Copy, Clone, Debug)]
+pub struct ForceRehome {
+    /// Region to move away from, if any.
+    pub avoid: Option<RegionId>,
+}
+
 pub struct DerpLatencyMeasurer {
     env: Env,
     /// The most recent derp map, retained so a periodic [`Remeasure`] can run without waiting for
@@ -38,6 +50,9 @@ pub struct DerpLatencyMeasurer {
     current_home: Option<RegionId>,
     /// When the home region last changed. Used for anti-flap hysteresis on lateral swaps.
     last_home_change: Option<Instant>,
+    /// One-shot forced re-home request: `Some(avoid)` makes the next selection ignore hysteresis
+    /// and deprioritize `avoid`. Consumed by the next [`Self::select_home`].
+    forced_rehome: Option<Option<RegionId>>,
 }
 
 impl DerpLatencyMeasurer {
@@ -82,16 +97,23 @@ impl DerpLatencyMeasurer {
 
     /// Select the home region from a fresh measurement, applying anti-flap hysteresis, and update
     /// the retained home state. Returns the region id that should be treated as home.
+    ///
+    /// A pending [`ForceRehome`] (one-shot) overrides the hysteresis for this selection and
+    /// deprioritizes its `avoid` region.
     fn select_home(&mut self, results: &[RegionResult]) -> Option<RegionId> {
-        let best = results.first().map(|r| r.id);
+        let forced = self.forced_rehome.take();
+        let avoid = forced.flatten();
+
+        let best = select_best(results, avoid);
         let current_reachable = self
             .current_home
             .map(|cur| results.iter().any(|r| r.id == cur))
             .unwrap_or(false);
-        let hysteresis_elapsed = self
-            .last_home_change
-            .map(|t| t.elapsed() >= Self::HOME_HYSTERESIS)
-            .unwrap_or(true);
+        let hysteresis_elapsed = forced.is_some()
+            || self
+                .last_home_change
+                .map(|t| t.elapsed() >= Self::HOME_HYSTERESIS)
+                .unwrap_or(true);
 
         let home = decide_home(
             self.current_home,
@@ -111,6 +133,20 @@ impl DerpLatencyMeasurer {
             self.current_home = home;
             self.last_home_change = Some(Instant::now());
         }
+    }
+}
+
+/// Pick the best (lowest-latency) region, deprioritizing `avoid`: the best non-avoided region
+/// wins; if the avoided region is the only one measured reachable, fall back to it — a bad home
+/// still beats no home. Pure (no I/O, no clock) so it can be unit-tested in isolation.
+fn select_best(results: &[RegionResult], avoid: Option<RegionId>) -> Option<RegionId> {
+    match avoid {
+        Some(a) => results
+            .iter()
+            .find(|r| r.id != a)
+            .or(results.first())
+            .map(|r| r.id),
+        None => results.first().map(|r| r.id),
     }
 }
 
@@ -173,7 +209,24 @@ impl kameo::Actor for DerpLatencyMeasurer {
             derp_map: None,
             current_home: None,
             last_home_change: None,
+            forced_rehome: None,
         })
+    }
+}
+
+impl Message<ForceRehome> for DerpLatencyMeasurer {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: ForceRehome,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        tracing::warn!(avoid = ?msg.avoid, current_home = ?self.current_home, "forced re-home requested");
+        self.forced_rehome = Some(msg.avoid);
+        // Re-measure immediately; if no derp map is retained yet this is a no-op and the
+        // forced flag is consumed by the next measurement that does run.
+        self.measure_and_publish().await;
     }
 }
 
@@ -205,14 +258,57 @@ impl Message<Remeasure> for DerpLatencyMeasurer {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{num::NonZeroU32, time::Duration};
 
     use ts_derp::RegionId;
+    use ts_netcheck::RegionResult;
 
-    use super::decide_home;
+    use super::{decide_home, select_best};
 
     fn r(n: u32) -> RegionId {
         RegionId(NonZeroU32::new(n).unwrap())
+    }
+
+    fn results(ids: &[u32]) -> Vec<RegionResult> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, &n)| RegionResult {
+                latency: Duration::from_millis(10 + i as u64),
+                id: r(n),
+                latency_map_key: format!("region-{n}"),
+                connected_remote: "127.0.0.1:3478".parse().unwrap(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_best_takes_lowest_latency_without_avoid() {
+        assert_eq!(select_best(&results(&[1, 2, 3]), None), Some(r(1)));
+        assert_eq!(select_best(&results(&[]), None), None);
+    }
+
+    #[test]
+    fn select_best_skips_avoided_region() {
+        // Forced re-home away from a one-way-dead relay: the stalled region may still
+        // answer latency probes, so it must be actively deprioritized.
+        assert_eq!(select_best(&results(&[1, 2, 3]), Some(r(1))), Some(r(2)));
+        assert_eq!(select_best(&results(&[1, 2, 3]), Some(r(2))), Some(r(1)));
+    }
+
+    #[test]
+    fn select_best_falls_back_to_avoided_when_it_is_the_only_region() {
+        // A bad home still beats no home — never strand the node without a relay.
+        assert_eq!(select_best(&results(&[1]), Some(r(1))), Some(r(1)));
+        assert_eq!(select_best(&results(&[]), Some(r(1))), None);
+    }
+
+    #[test]
+    fn forced_rehome_moves_off_reachable_current_home_inside_hysteresis() {
+        // Composition of the forced path: hysteresis is overridden (elapsed = true) and
+        // the stalled current home is avoided, so a reachable challenger wins even
+        // though a normal lateral swap would have been damped.
+        let best = select_best(&results(&[1, 2]), Some(r(1)));
+        assert_eq!(decide_home(Some(r(1)), true, best, true), Some(r(2)));
     }
 
     #[test]
