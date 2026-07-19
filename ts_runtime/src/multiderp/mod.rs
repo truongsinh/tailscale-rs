@@ -15,6 +15,7 @@ use kameo_actors::scheduler::SetTimeout;
 use ts_control::DerpRegion;
 use ts_derp::RegionId;
 use ts_transport::UnderlayTransportId;
+pub(crate) use uniderp::RxStallEvent;
 
 use crate::{Env, Error, multiderp::uniderp::Uniderp};
 
