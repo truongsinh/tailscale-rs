@@ -307,13 +307,26 @@ where
     }
 
     fn into_any_err(self) -> Option<Box<dyn ReplyError>> {
+        // Forward failures (missing name, dead target, closed mailbox) must NOT be
+        // reported as an unhandled handler error on the tell path: kameo stops the
+        // actor whose handler produced an unhandled error — i.e. the Registry itself —
+        // taking down the runtime's entire naming service (and dropping every queued
+        // forward) because one best-effort tell was misaddressed. Observed in the
+        // watchdog e2e test: a `ForceReconnect` tell to a not-yet-registered
+        // ControlRunner killed the Registry and lost the follow-up `ForceRehome`.
+        //
+        // Ask callers are unaffected: they receive the error through
+        // [`Reply::to_result`] via their reply channel.
         match self {
-            Self::Forwarded(res) => res.into_any_err(),
-            Self::ActorDead(m) => {
-                Some(Box::new(SendError::<M, R::Error>::ActorNotRunning(m)) as Box<dyn ReplyError>)
+            Self::Forwarded(res) => {
+                if let Some(e) = res.into_any_err() {
+                    tracing::debug!(error = ?e, "forward failed; dropped on tell path");
+                }
+                None
             }
-            Self::NotFound(m) => {
-                Some(Box::new(SendError::<M, R::Error>::ActorNotRunning(m)) as Box<dyn ReplyError>)
+            Self::ActorDead(_) | Self::NotFound(_) => {
+                tracing::debug!("forward to unavailable actor; dropped on tell path");
+                None
             }
         }
     }
