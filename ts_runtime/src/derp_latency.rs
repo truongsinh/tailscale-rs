@@ -107,9 +107,7 @@ impl HomeSelector {
         if let Some(region) = avoid {
             match now.checked_add(self.avoid_ttl) {
                 Some(until) => {
-                    if let Some(existing) =
-                        self.penalties.iter_mut().find(|p| p.region == region)
-                    {
+                    if let Some(existing) = self.penalties.iter_mut().find(|p| p.region == region) {
                         existing.until = until;
                     } else {
                         if self.penalties.len() >= Self::MAX_PENALIZED_REGIONS
