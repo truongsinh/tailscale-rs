@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "version": "0.4.0-0-g0e00c7d",
+  "published_at": "1970-01-01T00:00:00Z",
+  "targets": {
+    "x86_64-pc-windows-gnu": {
+      "url": "https://github.com/truongsinh/tailscale-rs/releases/download/fleet-manifest/koidra-gateway-0e00c7d.exe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 0
+    },
+    "x86_64-win7-windows-gnu": {
+      "url": "https://github.com/truongsinh/tailscale-rs/releases/download/fleet-manifest/koidra-gateway-0e00c7d.exe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 0
+    }
+  }
+}
