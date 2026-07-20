@@ -269,7 +269,7 @@ name = "ssh_peer_lookup"
 required-features = ["ssh"]
 
 [[example]]
-name = "ssh_shell"
+name = "koidra_gateway"
 required-features = ["ssh"]
 
 [[test]]

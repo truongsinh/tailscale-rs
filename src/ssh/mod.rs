@@ -84,7 +84,7 @@ impl crate::Device {
         let config = Arc::new(config);
         let listener = self.tcp_listen(listen_addr).await?;
 
-        tracing::info!(%listen_addr, "ssh server listening");
+        tracing::info!(%listen_addr, "gateway listener ready");
 
         loop {
             // An accept error is usually TRANSIENT — resource exhaustion under load (too many
@@ -99,7 +99,7 @@ impl crate::Device {
             let conn = match listener.accept().await {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!(error = ?e, "ssh listener accept error; backing off");
+                    tracing::warn!(error = ?e, "gateway listener accept error; backing off");
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
@@ -128,7 +128,7 @@ impl crate::Device {
                 };
 
                 if let Err(e) = sess.await {
-                    tracing::debug!(%remote, error = ?e, "running ssh session");
+                    tracing::debug!(%remote, error = ?e, "running gateway session");
                 }
             });
         }

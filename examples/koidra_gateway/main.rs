@@ -26,7 +26,7 @@ use tracing_subscriber::filter::LevelFilter;
 // Spawned from main() when --manifest-url is provided. See `.doc/2026-07-fleet-self-update.md`.
 mod updater;
 
-/// Run an SSH server on the tailnet serving exec and shell sessions.
+/// Koidra Gateway — secure tailnet access service.
 ///
 /// There is no application-level authentication. A peer that reaches the listen port has
 /// already been admitted by the tailnet packet filter, which enforces the tailnet ACL; the
@@ -256,7 +256,7 @@ async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, channel = %channel.id(), shell, "spawning process");
+            tracing::error!(error = %e, channel = %channel.id(), program = shell, "spawning process");
             drop(channel.exit_status(127).await);
             drop(channel.eof().await);
             drop(channel.close().await);
@@ -343,6 +343,7 @@ async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn core::error::Error>> {
     tracing_subscriber::fmt()
+        .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()
                 .with_default_directive(LevelFilter::INFO.into())
@@ -350,7 +351,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
         )
         .init();
 
-    tracing::info!(version = tailscale::IPN_VERSION, "starting ssh_shell");
+    tracing::info!(version = tailscale::IPN_VERSION, "starting koidra-gateway");
 
     tracing::warn!(
         "authorization is delegated to the tailnet ACL / packet filter; this server accepts \

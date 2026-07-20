@@ -4,7 +4,7 @@
 //! OpenSSL on Linux). Bypasses .NET entirely, so it works on Win7/PS2.0 boxes where
 //! PowerShell's `[Net.WebClient]::DownloadFile` fails (no TLS 1.2 in .NET 2.0 CLR).
 //!
-//! Ships inside the upgrade kit (`koidra-ssh-fleet/upgrade-kit-*/`). After the first
+//! Ships inside the upgrade kit (`koidra-gateway-fleet/upgrade-kit-*/`). After the first
 //! TeamViewer delivery of the kit to a Win7 box, `koidra_fetch.exe` is on-box
 //! permanently and every subsequent transfer uses it over the network — no more
 //! TeamViewer per roll.
@@ -27,7 +27,7 @@
 //! ## Design
 //!
 //! This is deliberately NOT the full P4 self-updater (no manifest, no version check,
-//! no supervisor integration — see `examples/ssh_shell/updater.rs` for that). It's
+//! no supervisor integration — see `examples/koidra_gateway/updater.rs` for that). It's
 //! the minimum primitive that unblocks transfers to Win7/PS2.0 boxes. The full
 //! self-updater builds on the same reqwest + sha2 pattern but adds the state machine
 //! + atomic binary swap + supervisor gate.

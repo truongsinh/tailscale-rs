@@ -129,7 +129,7 @@ where
             return Ok(Auth::reject());
         };
 
-        tracing::debug!(?peer, "accept ssh connection");
+        tracing::debug!(?peer, "accept gateway connection");
 
         Ok(Auth::Accept)
     }

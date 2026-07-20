@@ -34,10 +34,10 @@ pipes on every platform beats serving a pty everywhere except the platform we ca
 ## Example usage
 
 ```shell
-$ cargo run --example ssh_shell --features ssh -- \
+$ cargo run --example koidra_gateway --features ssh -- \
       -k $MY_AUTH_KEY -c $MY_CONFIG_FILE
 ...
-WARN ssh_shell: authorization is delegated to the tailnet ACL / packet filter; this server accepts any peer that reaches the listen port
+WARN koidra_gateway: authorization is delegated to the tailnet ACL / packet filter; this server accepts any peer that reaches the listen port
 INFO tailscale::ssh: ssh server listening listen_addr=$TAILNET_IP:22
 ...
 

@@ -5,7 +5,7 @@
 only against DLLs present in a stock Win7 SP1 install.
 
 ```console
-$ bin/build-win7 --example ssh_shell
+$ bin/build-win7 --example koidra_gateway
 ```
 
 Artifacts land in `target/x86_64-win7-windows-gnu/release/`, stripped in place.
@@ -53,7 +53,7 @@ The known risk areas, in the order they are likely to bite:
 - **Interactive PTY sessions are degraded.** ConPTY did not exist before Windows 10
   version 1809, so there is no supported way to allocate a pseudoconsole. Servers built
   from this tree refuse `pty-req` outright rather than pretend
-  (see `examples/ssh_shell`). Pipe-backed `shell` sessions and `exec` channels are
+  (see `examples/koidra_gateway`). Pipe-backed `shell` sessions and `exec` channels are
   unaffected and work normally; what you lose is terminal emulation — no line editing, no
   resize handling, and console programs that query the console handle directly will see a
   pipe and typically switch to non-interactive behaviour.
@@ -68,11 +68,11 @@ Win7. Check that assumption directly rather than trusting the target name:
 
 ```console
 $ x86_64-w64-mingw32-objdump -p \
-      target/x86_64-win7-windows-gnu/release/examples/ssh_shell.exe |
+      target/x86_64-win7-windows-gnu/release/examples/koidra_gateway.exe |
       grep 'DLL Name' | sort -u
 ```
 
-Every name in the output should be a stock Win7 system DLL. As of the `ssh_shell` example
+Every name in the output should be a stock Win7 system DLL. As of the `koidra_gateway` example
 that is `advapi32`, `bcrypt`, `iphlpapi`, `kernel32`, `msvcrt`, `ntdll`, `oleaut32`, and
 `ws2_32` — all present on a stock Win7 SP1 install (`bcrypt` since Vista).
 

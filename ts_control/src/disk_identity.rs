@@ -45,7 +45,7 @@ fn detect() -> String {
 
     // Probe the filesystem holding the running binary's install dir. The
     // parent of current_exe() matches the default install_dir computed in
-    // ssh_shell::main — i.e. the disk the updater actually stages into.
+    // koidra_gateway::main — i.e. the disk the updater actually stages into.
     let target_bytes: Vec<u8> = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|parent| parent.as_os_str().as_bytes().to_vec()))

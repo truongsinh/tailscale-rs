@@ -1,0 +1,44 @@
+[Unit]
+Description=Koidra Gateway — primary channel (tailnet access service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Self-contained: NO drop-in override needed (the old koidra-ssh units carried
+# TS_HOSTNAME + ExecStart in a *.service.d/override.conf — this unit inlines
+# everything so nothing is lost on the rebrand).
+#
+# TS_HOSTNAME keeps the dev console node name stable — it MUST match the old
+# koidra-ssh node name (vn-office-dev-server-primary) so the tailnet identity /
+# console name does not churn.
+Environment=TS_HOSTNAME=vn-office-dev-server-primary
+# Baked auth key. systemd Environment= is process-private (safe here, unlike
+# Windows machine env). Replace the placeholder with the real tskey-auth-... token
+# on the box (systemctl edit, or an EnvironmentFile drop-in) before enabling.
+Environment=AUTHKEY=tskey-auth-PLACEHOLDER-bake-real-key-here
+Environment=KOIDRA_TARGET=x86_64-unknown-linux-musl
+# REQUIRED runtime gate: the binary aborts with `UnstableEnvVar` at startup without
+# this (checked in src/lib.rs init). run.sh also exports it (belt-and-braces).
+Environment=TS_RS_EXPERIMENT=this_is_unstable_software
+WorkingDirectory=/home/sinh/koidra-gateway
+ExecStart=/home/sinh/koidra-gateway/run.sh primary 2222
+
+# Restart on unexpected exit, but give up after 2 failures in 60s so a wedged
+# binary can't spin forever (rollback is the coordinator's job, not an auto-revert).
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=2
+StartLimitIntervalSec=60
+
+# Hardening. ProtectHome is intentionally NOT set: the install dir is under /home,
+# and ProtectHome=yes would hide the unit's own run.sh / binary / node-*.json →
+# ExecStart fails → dead after the restart limit. ProtectSystem=strict makes the
+# rest of the FS read-only; the one writable path is the install dir itself.
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ReadWritePaths=/home/sinh/koidra-gateway
+
+[Install]
+WantedBy=multi-user.target
