@@ -15,7 +15,7 @@ use russh::{
     keys::Algorithm,
     server::{Auth, Handler, Msg, Session},
 };
-use tailscale::ssh::TailnetServer;
+use tailscale::{silent_proxy::ListenEndpoint, ssh::TailnetServer};
 use tokio::{
     fs,
     io::AsyncWriteExt,
@@ -60,6 +60,18 @@ struct Args {
     /// dev/test.
     #[arg(long = "install-dir", env = "KOIDRA_INSTALL_DIR")]
     install_dir: Option<PathBuf>,
+
+    /// Enable the silent SOCKS5 proxy over a Unix socket (Linux/macOS) or named pipe
+    /// (Windows). No TCP listener is opened; the proxy is invisible to `netstat` /
+    /// `ss -ltn` / `Get-NetTCPConnection`. See `tailscale::silent_proxy` for details.
+    ///
+    /// On Linux, the value is the socket path (default `/run/tailscale-koidra-proxy.sock`).
+    /// On Windows, the value is the bare pipe name without the `\\.\pipe\` prefix
+    /// (default `koidra-tailnet-proxy`).
+    ///
+    /// Pass the literal string `default` to use the platform default.
+    #[arg(long = "silent-proxy", env = "KOIDRA_SILENT_PROXY")]
+    silent_proxy: Option<String>,
 }
 
 /// An SSH server serving one connection.
@@ -351,6 +363,19 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
         updater::spawn(install_dir.clone(), tailscale::IPN_VERSION, url.to_string());
     }
 
+    // Spawn the silent SOCKS5 proxy if requested. The proxy listens on a Unix socket
+    // (Linux/macOS) or named pipe (Windows) so on-box scripts can dial out over the
+    // tailnet without opening a TCP port. See `tailscale::silent_proxy` for details.
+    if let Some(spec) = args.silent_proxy.as_deref() {
+        let endpoint = parse_silent_proxy_endpoint(spec);
+        let dev_for_proxy = dev.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dev_for_proxy.serve_silent_proxy(endpoint).await {
+                tracing::error!(error = %e, "silent-proxy server exited with error");
+            }
+        });
+    }
+
     dev.serve_ssh::<ShellServer>(
         russh::server::Config {
             keys: vec![russh::keys::PrivateKey::random(
@@ -396,4 +421,31 @@ async fn write_boot_state(install_dir: &Path, version: &str, target_ip: IpAddr) 
         let _ = fs::remove_file(&tmp).await;
     }
     tracing::debug!(path = %path.display(), %version, "boot-state written");
+}
+
+/// Parse the `--silent-proxy` CLI value into a [`ListenEndpoint`].
+///
+/// - `"default"` or empty string → platform default (`/run/tailscale-koidra-proxy.sock`
+///   on Linux/macOS, `\\.\pipe\koidra-tailnet-proxy` on Windows).
+/// - Any other value is taken as-is: a socket path on Unix, a pipe name on Windows.
+fn parse_silent_proxy_endpoint(spec: &str) -> ListenEndpoint {
+    if spec == "default" || spec.is_empty() {
+        return ListenEndpoint::platform_default();
+    }
+    // The spec is platform-specific — the user knows whether they're on Unix or Windows.
+    // Pick the matching variant so the type system carries the platform info end-to-end
+    // rather than trying to autodetect from the string (an autodetect would mis-classify
+    // `\\.\pipe\X` vs `/run/X.sock` on a cross-compile host).
+    #[cfg(unix)]
+    {
+        ListenEndpoint::Unix(PathBuf::from(spec))
+    }
+    #[cfg(windows)]
+    {
+        ListenEndpoint::Pipe(spec.to_string())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        compile_error!("silent_proxy: unsupported platform (need Unix socket or named pipe)");
+    }
 }

@@ -145,6 +145,7 @@ use ts_runtime::Spawn;
 pub mod axum;
 pub mod config;
 mod error;
+pub mod silent_proxy;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 
