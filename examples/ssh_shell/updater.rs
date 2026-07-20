@@ -19,6 +19,21 @@
 //!   → EXIT    process::exit(0); supervisor relaunches within 5 s
 //! ```
 //!
+//! ## Per-cohort manifests (split-brain fix, 2026-07-19)
+//!
+//! Each binary cohort (ssh_shell vs koidra-gateway) polls its OWN manifest URL —
+//! `fleet-manifest-ssh.json` vs `fleet-manifest-gateway.json` on the same release tag.
+//! The launcher embeds the cohort-specific URL via `--manifest-url` / `KOIDRA_MANIFEST_URL`,
+//! so a box never tries to "update" to the other cohort's binary shape. See
+//! `.doc/2026-07-per-cohort-manifest.md` for the full design.
+//!
+//! ## Downgrade protection
+//!
+//! The COMPARE step is semver-aware: it refuses to "update" to a version older than the
+//! running one, even if the manifest string differs. Format handled (see [`Version`]):
+//! `MAJOR.MINOR.PATCH` → `MAJOR.MINOR.PATCH-SEQ-gSHA` (git-describe) → bare SHA suffix
+//! (legacy `0.4.0-f6c10dd`). Close the source TODO from the MVP.
+//!
 //! ## Rollback
 //!
 //! The supervisor (not this code) runs a health-gate loop on the next launch: if the
@@ -36,6 +51,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+
+use std::cmp::Ordering;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -104,6 +121,144 @@ pub struct Manifest {
     #[allow(dead_code)]
     pub published_at: String,
     pub targets: std::collections::HashMap<String, ManifestTarget>,
+}
+
+/// A parsed `ipn_version`-shaped string, used by the COMPARE step for downgrade
+/// protection. See the module-level "Downgrade protection" doc for the format
+/// rationale.
+///
+/// Total order: `(major, minor, patch, seq, sha)` compared lexicographically —
+/// numeric for the first four fields, lexical (byte-compare) for the SHA tie-
+/// breaker. Higher `seq` = more commits after the base tag = newer.
+///
+/// Two of our published binaries at the same SHA produce equal `Version`s, so
+/// the updater correctly no-ops when the manifest re-advertises the running
+/// version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Version {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    /// Commits after the `MAJOR.MINOR.PATCH` tag, as reported by `git describe`.
+    /// Bare semver and legacy `MAJOR.MINOR.PATCH-SHA` forms parse to `0`.
+    seq: u64,
+    /// Trailing SHA (no `g` prefix). Empty for bare semver. Compared lexically.
+    sha: String,
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.major
+            .cmp(&other.major)
+            .then(self.minor.cmp(&other.minor))
+            .then(self.patch.cmp(&other.patch))
+            .then(self.seq.cmp(&other.seq))
+            .then(self.sha.cmp(&other.sha))
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Version {
+    /// Parse an `ipn_version`-shaped string.
+    ///
+    /// Accepted forms (most specific first):
+    /// - `MAJOR.MINOR.PATCH`                  → `(base, 0, "")`
+    /// - `MAJOR.MINOR.PATCH-SEQ-gSHA`         → `(base, SEQ, SHA)` (git-describe)
+    /// - `MAJOR.MINOR.PATCH-SHA`              → `(base, 0, SHA)` (legacy short)
+    ///
+    /// Returns `Err` on a missing/non-numeric base or non-numeric SEQ so the
+    /// caller can fall back to lexical string compare with a warn log, preserving
+    /// the MVP "different string = update" behaviour for unparseable inputs.
+    fn parse(s: &str) -> Result<Self, VersionParseError> {
+        // Split base semver from suffix at the first '-'. This is unambiguous for
+        // our shapes because the base is always MAJOR.MINOR.PATCH (no '-' inside).
+        let (base_part, suffix) = match s.split_once('-') {
+            Some((b, suf)) => (b, Some(suf)),
+            None => (s, None),
+        };
+
+        // Parse MAJOR.MINOR.PATCH — all three required, no more.
+        let mut parts = base_part.split('.');
+        let major = parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .ok_or(VersionParseError::BadBase)?;
+        let minor = parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .ok_or(VersionParseError::BadBase)?;
+        let patch = parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .ok_or(VersionParseError::BadBase)?;
+        if parts.next().is_some() {
+            return Err(VersionParseError::BadBase);
+        }
+
+        // Parse suffix: `SEQ-gSHA` (git-describe), bare SHA (legacy), or none.
+        let (seq, sha) = match suffix {
+            None => (0, String::new()),
+            Some(suf) => match suf.split_once("-g") {
+                Some((seq_str, sha_part)) => {
+                    let seq = seq_str
+                        .parse::<u64>()
+                        .map_err(|_| VersionParseError::BadSeq(seq_str.to_string()))?;
+                    (seq, sha_part.to_string())
+                }
+                None => (0, suf.to_string()),
+            },
+        };
+
+        Ok(Self {
+            major,
+            minor,
+            patch,
+            seq,
+            sha,
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+enum VersionParseError {
+    #[error("missing or non-numeric MAJOR.MINOR.PATCH base")]
+    BadBase,
+    #[error("non-numeric SEQ in git-describe suffix: {0}")]
+    BadSeq(String),
+}
+
+/// Outcome of comparing the running version against the manifest version.
+#[derive(Debug, PartialEq, Eq)]
+enum VersionComparison {
+    /// Manifest version equals running — no action needed.
+    Equal,
+    /// Manifest version is strictly newer — proceed with update.
+    Newer,
+    /// Manifest version is strictly older — refuse to downgrade.
+    Older,
+    /// One or both sides failed to parse — caller falls back to lexical compare.
+    Unparseable,
+}
+
+/// Compare running `current` against `manifest`. Both sides parse → strict
+/// ordering by [`Version::cmp`]. Either side fails to parse → [`VersionComparison::Unparseable`],
+/// signalling the caller to fall back to the MVP string-compare policy (we
+/// publish the manifest, so we don't hard-block the fleet when the publisher
+/// ships an exotic format).
+fn compare_versions(current: &str, manifest: &str) -> VersionComparison {
+    match (Version::parse(current), Version::parse(manifest)) {
+        (Ok(cur), Ok(man)) => match man.cmp(&cur) {
+            Ordering::Equal => VersionComparison::Equal,
+            Ordering::Greater => VersionComparison::Newer,
+            Ordering::Less => VersionComparison::Older,
+        },
+        _ => VersionComparison::Unparseable,
+    }
 }
 
 /// Spawn the updater task. Non-blocking; the task runs for the process lifetime.
@@ -194,19 +349,46 @@ pub(crate) async fn run_one_cycle(
         )));
     }
 
-    // COMPARE
-    if manifest.version == current_version {
-        info!(version = current_version, "manifest version matches current; no update");
-        return Ok(CycleOutcome::NoUpdate);
+    // COMPARE — semver-aware. Refuses to "update" to an older version so a
+    // misconfigured manifest can't regress the fleet. Closes the source TODO from
+    // the MVP. See [`Version`] for the format and ordering rules.
+    match compare_versions(current_version, &manifest.version) {
+        VersionComparison::Equal => {
+            info!(version = current_version, "manifest version matches current; no update");
+            return Ok(CycleOutcome::NoUpdate);
+        }
+        VersionComparison::Newer => {
+            info!(
+                manifest_version = %manifest.version,
+                current_version,
+                "manifest version is newer; starting update"
+            );
+        }
+        VersionComparison::Older => {
+            warn!(
+                manifest_version = %manifest.version,
+                current_version,
+                "manifest version is OLDER than current; refusing to downgrade (skipping cycle)"
+            );
+            return Ok(CycleOutcome::NoUpdate);
+        }
+        VersionComparison::Unparseable => {
+            // One or both sides didn't look like IPN_VERSION — fall back to the
+            // MVP "different string = update" policy. The manifest publisher is
+            // trusted, so we don't hard-block the fleet on a parse failure; we
+            // still short-circuit on exact string equality so an identical
+            // unparseable version is a no-op.
+            if manifest.version == current_version {
+                info!(version = current_version, "manifest version matches current (unparseable); no update");
+                return Ok(CycleOutcome::NoUpdate);
+            }
+            warn!(
+                manifest_version = %manifest.version,
+                current_version,
+                "could not parse one or both versions; falling back to string-different=update"
+            );
+        }
     }
-    // MVP: string-different = update. We publish the manifest, so we won't push a
-    // downgrade. TODO (follow-up): semver-aware no-downgrade check so a misconfigured
-    // manifest can't regress the fleet.
-    info!(
-        manifest_version = %manifest.version,
-        current_version,
-        "manifest version differs; starting update"
-    );
 
     // Look up our target triple. `KOIDRA_TARGET` env var wins (fleet launchers set it
     // to handle the custom win7-windows-gnu Tier 3 triple); otherwise we fall back to
@@ -717,10 +899,15 @@ mod tests {
         let binary_url = format!("http://127.0.0.1:{}/binary", port);
         let manifest_url = format!("http://127.0.0.1:{}/manifest.json", port);
 
+        // Use realistic git-describe versions so the semver comparator sees the
+        // manifest as a true upgrade (higher SEQ). Older binary = seq 100, new = 200.
+        let current_ver = "0.4.0-100-g0000000old";
+        let manifest_ver = "0.4.0-200-g0000000new";
+
         // Manifest advertising the new version, pointing at our mock /binary endpoint.
         let manifest = serde_json::json!({
             "schema": 1,
-            "version": "0.4.0-NEW_FAKE",
+            "version": manifest_ver,
             "published_at": "2026-07-18T12:00:00Z",
             "targets": {
                 current_target_triple(): {
@@ -734,9 +921,9 @@ mod tests {
         // Start serving.
         serve_mock(listener, manifest.to_string(), new_binary_contents.clone());
 
-        // Run one cycle. Current version is "0.4.0-OLD" → manifest's "0.4.0-NEW_FAKE"
-        // differs → the full FETCH→DOWNLOAD→VERIFY→STAGE→COMMIT path should fire.
-        let outcome = run_one_cycle(install, "0.4.0-OLD", &manifest_url)
+        // Run one cycle. Manifest seq 200 > current seq 100 → upgrade path fires
+        // (FETCH → DOWNLOAD → VERIFY → STAGE → COMMIT).
+        let outcome = run_one_cycle(install, current_ver, &manifest_url)
             .await
             .expect("cycle should succeed");
 
@@ -748,7 +935,7 @@ mod tests {
             .unwrap();
         let current_name = current_name.trim();
         assert!(
-            current_name.contains("0.4.0-NEW_FAKE"),
+            current_name.contains(manifest_ver),
             "current-ssh-shell.txt should contain the new version, got: {}",
             current_name
         );
@@ -772,20 +959,264 @@ mod tests {
 
         let (listener, port) = bind_mock_port().await;
         let manifest_url = format!("http://127.0.0.1:{}/manifest.json", port);
+        // Realistic git-describe form: both sides equal → COMPARE returns Equal.
+        let same_ver = "0.4.0-200-g00000000";
         let manifest = serde_json::json!({
             "schema": 1,
-            "version": "0.4.0-SAME",
+            "version": same_ver,
             "published_at": "2026-07-18T12:00:00Z",
             "targets": {}
         });
         serve_mock(listener, manifest.to_string(), vec![]);
 
-        let outcome = run_one_cycle(install, "0.4.0-SAME", &manifest_url)
+        let outcome = run_one_cycle(install, same_ver, &manifest_url)
             .await
             .expect("cycle should succeed");
 
         assert_eq!(outcome, CycleOutcome::NoUpdate);
         // current-ssh-shell.txt should NOT exist (we never wrote it).
         assert!(!install.join(CURRENT_EXE_NAME).exists());
+    }
+
+    // ── Downgrade-protection (semver-aware COMPARE) ───────────────────────────
+
+    #[test]
+    fn version_parse_bare_semver() {
+        let v = Version::parse("0.4.0").unwrap();
+        assert_eq!((v.major, v.minor, v.patch, v.seq, v.sha.as_str()), (0, 4, 0, 0, ""));
+    }
+
+    #[test]
+    fn version_parse_git_describe() {
+        let v = Version::parse("0.4.0-253-g301ee7a").unwrap();
+        assert_eq!((v.major, v.minor, v.patch, v.seq, v.sha.as_str()), (0, 4, 0, 253, "301ee7a"));
+    }
+
+    #[test]
+    fn version_parse_legacy_bare_sha() {
+        // Legacy form used by the MVP: `0.4.0-<short-sha>` (no SEQ, no `g` prefix).
+        let v = Version::parse("0.4.0-f6c10dd").unwrap();
+        assert_eq!((v.major, v.minor, v.patch, v.seq, v.sha.as_str()), (0, 4, 0, 0, "f6c10dd"));
+    }
+
+    #[test]
+    fn version_parse_rejects_missing_or_bad_base() {
+        // Too few components.
+        assert!(Version::parse("1").is_err());
+        assert!(Version::parse("1.2").is_err());
+        // Non-numeric components.
+        assert!(Version::parse("a.b.c").is_err());
+        assert!(Version::parse("0.4.x").is_err());
+        // Too many components.
+        assert!(Version::parse("1.2.3.4").is_err());
+        // Empty string.
+        assert!(Version::parse("").is_err());
+    }
+
+    #[test]
+    fn version_parse_rejects_bad_seq() {
+        // SEQ-gSHA form but SEQ is not numeric.
+        let err = Version::parse("0.4.0-abc-g1234567").unwrap_err();
+        assert!(matches!(err, VersionParseError::BadSeq(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn version_ordering_base_semver_numeric() {
+        let a = Version::parse("0.4.0").unwrap();
+        let b = Version::parse("0.4.1").unwrap();
+        assert!(a < b, "{a:?} should be < {b:?}");
+        let c = Version::parse("0.5.0").unwrap();
+        assert!(b < c);
+        let d = Version::parse("1.0.0").unwrap();
+        assert!(c < d);
+        // 0.10.0 > 0.9.0 (numeric, NOT lexical — guards against "9" > "10" string sort).
+        let e = Version::parse("0.9.0").unwrap();
+        let f = Version::parse("0.10.0").unwrap();
+        assert!(e < f);
+    }
+
+    #[test]
+    fn version_ordering_seq_as_tiebreak() {
+        // Same base, different SEQ. Higher SEQ = more commits after tag = newer.
+        let a = Version::parse("0.4.0-10-gaaaaaaa").unwrap();
+        let b = Version::parse("0.4.0-253-gbbbbbbb").unwrap();
+        assert!(a < b, "{a:?} should be < {b:?}");
+    }
+
+    #[test]
+    fn version_ordering_sha_lexicographic_when_seq_equal() {
+        let a = Version::parse("0.4.0-253-g1111111").unwrap();
+        let b = Version::parse("0.4.0-253-g2222222").unwrap();
+        assert!(a < b, "{a:?} should be < {b:?}");
+        let c = Version::parse("0.4.0-253-g1111111").unwrap();
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn version_ordering_cross_format() {
+        // git-describe at seq=253 is newer than legacy bare SHA at same base.
+        let legacy = Version::parse("0.4.0-f6c10dd").unwrap();
+        let describe = Version::parse("0.4.0-253-g301ee7a").unwrap();
+        assert!(legacy < describe);
+        // Bare semver (seq=0, empty SHA) sorts BELOW a non-empty SHA at same seq
+        // because "" < any non-empty string lexicographically. Edge case; accepted.
+        let bare = Version::parse("0.4.0").unwrap();
+        assert!(bare < legacy, "bare semver sorts below legacy SHA at same seq");
+    }
+
+    #[test]
+    fn version_ordering_equal() {
+        let a = Version::parse("0.4.0-253-g301ee7a").unwrap();
+        let b = Version::parse("0.4.0-253-g301ee7a").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.cmp(&b), Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_versions_classifies_upgrade() {
+        // Higher SEQ = upgrade.
+        assert_eq!(
+            compare_versions("0.4.0-253-g301ee7a", "0.4.0-260-gabcdef0"),
+            VersionComparison::Newer,
+        );
+        // Higher patch = upgrade, even when current has higher SEQ.
+        assert_eq!(
+            compare_versions("0.4.99-9999-gzzzzzzz", "0.4.100-0-g"),
+            VersionComparison::Newer,
+        );
+    }
+
+    #[test]
+    fn compare_versions_classifies_equal() {
+        assert_eq!(
+            compare_versions("0.4.0-253-g301ee7a", "0.4.0-253-g301ee7a"),
+            VersionComparison::Equal,
+        );
+    }
+
+    #[test]
+    fn compare_versions_classifies_downgrade() {
+        // Lower SEQ = downgrade.
+        assert_eq!(
+            compare_versions("0.4.0-260-gabcdef0", "0.4.0-253-g301ee7a"),
+            VersionComparison::Older,
+        );
+        // Lower minor = downgrade, even when manifest has higher SEQ.
+        assert_eq!(
+            compare_versions("0.5.0-1-g0000001", "0.4.99-9999-gffffff"),
+            VersionComparison::Older,
+        );
+    }
+
+    #[test]
+    fn compare_versions_unparseable_when_either_side_bad() {
+        assert_eq!(
+            compare_versions("0.4.0-253-g301ee7a", "garbage"),
+            VersionComparison::Unparseable,
+        );
+        assert_eq!(
+            compare_versions("garbage", "0.4.0-253-g301ee7a"),
+            VersionComparison::Unparseable,
+        );
+        // Both garbage is still unparseable — caller will lexical-compare.
+        assert_eq!(
+            compare_versions("foo", "foo"),
+            VersionComparison::Unparseable,
+        );
+    }
+
+    #[tokio::test]
+    async fn run_one_cycle_refuses_downgrade() {
+        // Regression guard for the source-side "no downgrade" TODO. Manifest at
+        // seq=100, current at seq=253 → cycle must NoUpdate and NOT touch disk.
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path();
+
+        let (listener, port) = bind_mock_port().await;
+        let manifest_url = format!("http://127.0.0.1:{}/manifest.json", port);
+        // Pointless target entries — the COMPARE phase must short-circuit before
+        // they're read. A regression that lets the cycle proceed would hit the
+        // bogus sha256 and fail the cycle with Sha256 mismatch, which the assert
+        // below distinguishes from a clean NoUpdate.
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "version": "0.4.0-100-g00000old",
+            "published_at": "2026-07-18T12:00:00Z",
+            "targets": {
+                current_target_triple(): {
+                    "url": format!("http://127.0.0.1:{}/binary", port),
+                    "sha256": "deadbeef".to_string(),
+                    "size": 1_u64,
+                }
+            }
+        });
+        serve_mock(listener, manifest.to_string(), vec![0u8]);
+
+        let outcome = run_one_cycle(install, "0.4.0-253-g301ee7a", &manifest_url)
+            .await
+            .expect("cycle should succeed (NoUpdate path, not error)");
+        assert_eq!(outcome, CycleOutcome::NoUpdate);
+
+        // current-ssh-shell.txt should NOT exist — COMPARE short-circuited.
+        assert!(!install.join(CURRENT_EXE_NAME).exists());
+
+        // No staged binary either. (Lockfile may exist if the test ran fast
+        // enough to create then drop it, but a `ssh_shell-*` stage file would
+        // indicate the pipeline wrongly proceeded past COMPARE.)
+        let mut entries = fs::read_dir(install).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with("ssh_shell-"),
+                "found unexpected staged binary: {name}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_one_cycle_unparseable_falls_back_to_string_different_update() {
+        // MVP-fallback path: one side can't parse. If the strings differ we
+        // still allow the update (publisher is trusted).
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path();
+        atomic_write(&install.join(CURRENT_EXE_NAME), b"ssh_shell-old")
+            .await
+            .unwrap();
+
+        let new_binary_contents: Vec<u8> = b"#!/bin/sh\necho new\n".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&new_binary_contents);
+        let new_sha = hex_encode(&hasher.finalize());
+
+        let (listener, port) = bind_mock_port().await;
+        let binary_url = format!("http://127.0.0.1:{}/binary", port);
+        let manifest_url = format!("http://127.0.0.1:{}/manifest.json", port);
+
+        // Manifest version is a non-IPN_VERSION string; current is also garbage.
+        // Both fail to parse → Unparseable → fallback to "different = update".
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "version": "canary-2026-07-19",
+            "published_at": "2026-07-19T00:00:00Z",
+            "targets": {
+                current_target_triple(): {
+                    "url": binary_url,
+                    "sha256": new_sha,
+                    "size": new_binary_contents.len() as u64,
+                }
+            }
+        });
+        serve_mock(listener, manifest.to_string(), new_binary_contents.clone());
+
+        let outcome = run_one_cycle(install, "canary-2026-07-18", &manifest_url)
+            .await
+            .expect("cycle should succeed");
+        assert_eq!(outcome, CycleOutcome::Updated);
+
+        let current = fs::read_to_string(&install.join(CURRENT_EXE_NAME))
+            .await
+            .unwrap();
+        assert!(current.contains("canary-2026-07-19"), "got: {current}");
     }
 }

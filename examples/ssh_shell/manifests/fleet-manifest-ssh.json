@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "version": "0.4.0-0-gPLACEHOLDER",
+  "published_at": "1970-01-01T00:00:00Z",
+  "targets": {
+    "x86_64-unknown-linux-musl": {
+      "url": "https://github.com/truongsinh/tailscale-rs/releases/download/fleet-manifest/ssh_shell-PLACEHOLDER-linux-musl",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 0
+    }
+  }
+}
