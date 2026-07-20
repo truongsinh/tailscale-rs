@@ -153,7 +153,7 @@ impl ProxyListener {
                     instances.push(
                         ServerOptions::new()
                             .first_pipe_instance(false)
-                            .max_instances(255)
+                            .max_instances(254)
                             .out_buffer_size(64 * 1024)
                             .in_buffer_size(64 * 1024)
                             .create(&pipe_path)?,
@@ -204,7 +204,7 @@ impl ProxyListener {
                 use tokio::net::windows::named_pipe::ServerOptions;
                 match ServerOptions::new()
                     .first_pipe_instance(false)
-                    .max_instances(255)
+                    .max_instances(254)
                     .out_buffer_size(64 * 1024)
                     .in_buffer_size(64 * 1024)
                     .create(&pipe_path)
