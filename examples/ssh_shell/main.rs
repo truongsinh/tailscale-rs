@@ -12,7 +12,6 @@ use std::{collections::HashMap, net::IpAddr, path::PathBuf, process::Stdio, sync
 use clap::Parser;
 use russh::{
     Channel, ChannelId,
-    keys::Algorithm,
     server::{Auth, Handle, Handler, Msg, Session},
 };
 use tailscale::ssh::TailnetServer;
@@ -43,6 +42,32 @@ struct Args {
     /// Port to listen on (on tailnet IPv4)
     #[clap(short, long, default_value_t = 22)]
     listen_port: u16,
+
+    /// Path to the persistent SSH host key. Loaded if it exists, generated and written
+    /// (0600 on Unix) if not. Defaults to `ssh_host_ed25519_key` next to `--key-file`,
+    /// so primary and backup channels sharing an install dir share the host key
+    /// automatically.
+    ///
+    /// Override only when the two channels run from different install dirs but should
+    /// still present the same host identity — point both at the same absolute path.
+    #[arg(long = "host-key", env = "KOIDRA_SSH_HOST_KEY")]
+    host_key: Option<PathBuf>,
+}
+
+impl Args {
+    /// Resolve the host-key path: explicit `--host-key`, else the default next to the
+    /// tailscale key file.
+    fn host_key_path(&self) -> PathBuf {
+        match &self.host_key {
+            Some(p) => p.clone(),
+            None => {
+                let parent = self.key_file.parent().filter(|p| !p.as_os_str().is_empty());
+                parent
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("ssh_host_ed25519_key")
+            }
+        }
+    }
 }
 
 /// An SSH server serving one connection.
@@ -370,6 +395,9 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
 
     let args = Args::parse();
 
+    // Resolve the host-key path before we move anything out of `args` below.
+    let host_key_path = args.host_key_path();
+
     let dev = tailscale::Device::new(
         &tailscale::Config::default_with_key_file(&args.key_file).await?,
         args.auth_key,
@@ -379,12 +407,15 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     let ipv4: IpAddr = dev.ipv4_addr().await?.into();
     let dev = Arc::new(dev);
 
+    // Persistent host key: load if present, generate + write if absent. Both channels of
+    // a primary/backup pair point at the same path (default: next to `--key-file`) so the
+    // same physical box presents the same host identity regardless of which channel
+    // answered. See `tailscale::ssh::host_key` for the full design.
+    let host_key = tailscale::ssh::load_or_generate_host_key(&host_key_path).await?;
+
     dev.serve_ssh::<ShellServer>(
         russh::server::Config {
-            keys: vec![russh::keys::PrivateKey::random(
-                &mut rand::rng(),
-                Algorithm::Ed25519,
-            )?],
+            keys: vec![host_key],
             methods: russh::MethodSet::from(&[russh::MethodKind::None][..]),
             nodelay: true,
             ..Default::default()

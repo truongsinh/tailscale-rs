@@ -8,8 +8,13 @@ lets through: there is no application-level authentication. `none` is the only m
 never gets as far as authenticating. The `ssh` policy file block is still not consulted — tighten
 who may reach this port in the tailnet ACL / packet filter, not here.
 
-The server key is randomized on each start, so you will likely want to connect using
-`-o StrictHostKeyChecking=no`.
+The server key is **persistent**: on first start an Ed25519 key is generated and written
+to disk (0600 on Unix, inheriting the install dir's ACL on Windows); on every subsequent
+start that key is loaded, so `known_hosts` entries survive relaunches and channel swaps.
+Primary and backup channels point at the same key file — by default `ssh_host_ed25519_key`
+next to the tailscale key file (`-c`), or override with `--host-key <path>` /
+`KOIDRA_SSH_HOST_KEY`. See [`tailscale::ssh::host_key`](../../src/ssh/host_key.rs) for the
+full design, including first-start race handling.
 
 Whether any of this belongs upstream is under discussion in
 [tailscale/tailscale-rs#285](https://github.com/tailscale/tailscale-rs/issues/285).
