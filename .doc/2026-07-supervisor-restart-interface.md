@@ -70,7 +70,15 @@ State files in install dir:
 | `.rollback-stack.txt` | supervisor (under gate) | LIFO of up to 3 previous exe filenames; pop = revert. |
 | `.koidra-ssh-update.lock` | Charlie's updater only | Per-box advisory lock so both channels don't swap simultaneously. |
 
-Gate algorithm (per supervisor cycle, ~5 s on Windows; systemd `Restart=on-failure`):
+Gate algorithm (per supervisor cycle, ~5 s on Windows; systemd `Restart=always`):
+
+> **2026-07-21 correction:** the original design assumed `Restart=on-failure`,
+> which does NOT restart on the updater's clean `process::exit(0)` — the service
+> stays dead and SSH is wedged. Verified via local systemd repro
+> (`systemd-run --property="Restart=on-failure"` + `exit 0` = `inactive/dead`,
+> `NRestarts=0`; same with `Restart=always` = `auto-restart`, `NRestarts=3`).
+> Both template units now carry `Restart=always`; `systemctl stop` still wins
+> because systemd does not honor `Restart=` on a clean operator-initiated stop.
 
 ```
 1. read current-ssh-shell.txt -> EXE  (default if missing)
