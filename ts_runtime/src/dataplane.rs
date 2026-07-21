@@ -1,27 +1,31 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    fmt::{Debug, Formatter},
+    sync::Arc,
+};
 
+use futures_util::StreamExt;
 use kameo::{
     actor::{ActorRef, Spawn},
-    message::{Context, Message},
+    message::{Context, Message, StreamMessage},
 };
 use ts_dataplane::async_tokio::{FromOverlay, FromUnderlay, Rx, ToOverlay, ToUnderlay, Tx};
+use ts_disco_protocol::{Packet, Plaintext};
+use ts_packet::PacketMut;
 use ts_transport::{OverlayTransportId, UnderlayTransportId};
 
 use crate::{
-    Error, Task,
     disco_handler,
+    Error, Task,
     env::Env,
     packetfilter::PacketFilterState,
-    peer_tracker::{PeerDb, PeerState},
+    peer_tracker::PeerState,
     route_updater::{PeerRouteUpdate, SelfRouteUpdate},
     src_filter::SourceFilterState,
 };
 
 pub struct DataplaneActor {
     dataplane: Arc<ts_dataplane::async_tokio::DataPlane>,
-    /// Latest snapshot of the peer database, shared with the Disco handler task.
-    /// `None` until the first [`PeerState`] update arrives.
-    peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
+    env: Env,
 }
 
 #[kameo::messages]
@@ -41,19 +45,56 @@ impl DataplaneActor {
     }
 }
 
+pub type DiscoPacket = yoke::Yoke<&'static Packet<Plaintext>, ts_packet::Packet>;
+
+#[derive(Clone)]
+pub struct IncomingDiscoMsg(pub DiscoPacket);
+
+impl Debug for IncomingDiscoMsg {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.get().fmt(f)
+    }
+}
+
+impl AsRef<Packet<Plaintext>> for IncomingDiscoMsg {
+    fn as_ref(&self) -> &Packet<Plaintext> {
+        self.0.get()
+    }
+}
+
+struct DiscoInternal(PacketMut);
+
+#[derive(Debug, Clone)]
+#[expect(dead_code)]
+pub struct IncomingStunMsg(pub ts_packet::Packet);
+
+struct StunInternal(PacketMut);
+
 impl kameo::Actor for DataplaneActor {
     type Args = Env;
     type Error = Error;
 
     async fn on_start(env: Self::Args, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // Capture the disco_rx channel — previously dropped via `..`, which caused
-        // every incoming Disco Ping to be silently discarded by the dataplane's
-        // `disco_out.send()` (returning Err with "disco packets dropped: no
-        // receiver"). The stun_rx is still dropped today (the Stunner actor probes
-        // STUN servers out-of-band and does not consume from this channel).
-        let (dataplane, disco_rx, _stun_rx) =
+        let (dataplane, disco, stun) =
             ts_dataplane::async_tokio::DataPlane::new(env.keys.node_keys.clone());
+
         let dataplane = Arc::new(dataplane);
+
+        slf.attach_stream(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(disco)
+                .flat_map(tokio_stream::iter)
+                .map(DiscoInternal),
+            (),
+            (),
+        );
+
+        slf.attach_stream(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(stun)
+                .flat_map(tokio_stream::iter)
+                .map(StunInternal),
+            (),
+            (),
+        );
 
         env.subscribe::<PeerRouteUpdate>(&slf).await?;
         env.subscribe::<SelfRouteUpdate>(&slf).await?;
@@ -62,33 +103,88 @@ impl kameo::Actor for DataplaneActor {
         env.subscribe::<Arc<PeerState>>(&slf).await?;
 
         let task_dataplane = dataplane.clone();
+
         Task::spawn_link(&slf, async move {
             task_dataplane.run().await;
         })
         .await;
 
-        // Spawn the Disco Ping → Pong handler. It reads from disco_rx (produced by
-        // the dataplane loop above) and sends Pong responses back via the dataplane's
-        // underlay transports. The handler needs our disco private key (for decrypt
-        // + encrypt) and the shared peer_db snapshot (to look up the sender's
-        // PeerId from their DiscoPublicKey).
-        let peer_db: Arc<RwLock<Option<Arc<PeerDb>>>> =
-            Arc::new(RwLock::new(None));
-        let disco_keys = env.keys.disco_keys.clone();
-        let handler_db = peer_db.clone();
-        let handler_dp = dataplane.clone();
-        Task::spawn_link(&slf, async move {
-            disco_handler::run(disco_rx, disco_keys, handler_db, handler_dp).await;
-        })
+        // Spawn the Disco Ping → Pong handler as a supervised child actor.
+        // Subscribes to IncomingDiscoMsg (which we publish from the
+        // StreamMessage<DiscoInternal> handler below) and Arc<PeerState>
+        // (for sender DiscoKey → PeerId routing). The actor maintains its
+        // own peer_db snapshot from bus events.
+        disco_handler::DiscoHandlerActor::supervise(
+            &slf,
+            (env.clone(), env.keys.disco_keys.clone(), dataplane.clone()),
+        )
+        .spawn()
         .await;
 
         tracing::trace!("dataplane running");
         env.register(None, &slf).await?;
 
-        Ok(Self {
-            dataplane,
-            peer_db,
-        })
+        Ok(Self { dataplane, env })
+    }
+}
+
+impl Message<StreamMessage<DiscoInternal, (), ()>> for DataplaneActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: StreamMessage<DiscoInternal, (), ()>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        let mut buf = match msg {
+            StreamMessage::Next(pkt) => pkt.0,
+            _ => return,
+        };
+
+        let pkt = match Packet::from_encrypted_bytes_mut(buf.as_mut()) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+                tracing::error!(error = %e, "parsing disco message");
+                return;
+            }
+        };
+
+        if let Err(e) = pkt.decrypt_in_place(&self.env.keys.disco_keys.private) {
+            tracing::error!(error = %e, "decrypting disco message");
+            return;
+        };
+
+        let pkt = yoke::Yoke::<&'static Packet<Plaintext>, _>::try_attach_to_cart(
+            buf.freeze(),
+            // SAFETY: we just parsed this from the same buffer, so type/version are set correctly.
+            |buf| unsafe { Packet::from_bytes_unchecked(buf) },
+        )
+        .unwrap();
+        let pkt = IncomingDiscoMsg(pkt);
+
+        tracing::trace!(?pkt, "decrypted disco message");
+
+        self.env.publish_noretain(pkt).await.unwrap();
+    }
+}
+
+impl Message<StreamMessage<StunInternal, (), ()>> for DataplaneActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: StreamMessage<StunInternal, (), ()>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        let pkt = match msg {
+            StreamMessage::Next(pkt) => pkt.0,
+            _ => return,
+        };
+
+        self.env
+            .publish_noretain(IncomingStunMsg(pkt.freeze()))
+            .await
+            .unwrap();
     }
 }
 
@@ -148,13 +244,6 @@ impl Message<Arc<PeerState>> for DataplaneActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: Arc<PeerState>, _ctx: &mut Context<Self, Self::Reply>) {
-        // Publish the latest PeerDb snapshot to the Disco handler before touching
-        // WireGuard state — ordering doesn't matter (both are independent readers),
-        // but doing the write under the same actor turn keeps the snapshot fresh.
-        if let Ok(mut slot) = self.peer_db.write() {
-            *slot = Some(msg.peers.clone());
-        }
-
         {
             let mut dp = self.dataplane.inner().await;
             let wg = &mut dp.wireguard;

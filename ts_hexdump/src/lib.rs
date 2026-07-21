@@ -6,6 +6,10 @@ extern crate alloc;
 
 use core::{fmt, iter::FusedIterator};
 
+mod iter;
+
+pub use iter::IterFmt;
+
 /// The 16 hexadecimal digits as `char`s, with digits a-f as lowercase.
 const LOWERCASE_HEX_CHARS: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',

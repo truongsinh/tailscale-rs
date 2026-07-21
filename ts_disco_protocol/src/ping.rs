@@ -45,11 +45,20 @@ impl Ping {
 
 impl Debug for &Ping {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Ping")
-            .field("tx_id", &self.tx_id)
-            .field("node_key", &self.node_key)
-            .field("padding", &&self.padding)
-            .finish()
+        let mut dbg = f.debug_struct("Ping");
+
+        dbg.field("node_key", &self.node_key).field(
+            "tx_id",
+            &format_args!("{:02x}", ts_hexdump::IterFmt::contiguous(&self.tx_id)),
+        );
+
+        if self.padding.iter().any(|&x| x != 0) {
+            dbg.field("padding", &format_args!("<nonzero> {:x?}", &self.padding));
+        } else {
+            dbg.field("padding", &self.padding.len());
+        };
+
+        dbg.finish()
     }
 }
 

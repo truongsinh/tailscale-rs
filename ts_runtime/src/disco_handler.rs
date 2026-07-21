@@ -1,16 +1,33 @@
 //! Disco protocol message handler.
 //!
-//! Consumes [`DiscoBatch`]es from the dataplane's `disco_out` channel and handles
-//! incoming Disco messages. Currently handles [`Ping`] → [`Pong`] responses so that
+//! Kameo actor that subscribes to [`IncomingDiscoMsg`] events published by
+//! [`crate::dataplane::DataplaneActor`] on the bus and handles incoming Disco
+//! messages. Currently handles [`Ping`] → [`Pong`] responses so that
 //! `tailscale ping` works against this node in userspace-networking (DERP-relayed)
 //! mode.
 //!
-//! Before this handler existed, the [`DataplaneActor`] dropped the `disco_rx` channel
-//! returned by [`ts_dataplane::async_tokio::DataPlane::new`], so every incoming Disco
-//! Ping was silently dropped by the dataplane's `disco_out.send()` (returning `Err`
-//! with the warning "disco packets dropped: no receiver"). No Pong was ever sent,
-//! causing `tailscale ping <peer>` to time out for every peer even though WireGuard
-//! tunneled traffic (TCP/SSH/SOCKS5) worked fine.
+//! # Architecture (post upstream sync)
+//!
+//! Pre-merge, the fork's [`DataplaneActor::on_start`] captured the `disco_rx`
+//! channel directly and spawned this handler as a free `async fn` task that
+//! polled it. Upstream commit `95a5a08` ("runtime/dataplane: forward stun, disco
+//! streams") replaced that with a bus-publish pattern: the dataplane attaches the
+//! `disco_rx` as a kameo `attach_stream`, decrypts each batch inline, and publishes
+//! the decrypted [`Packet<Plaintext>`] to the bus as [`IncomingDiscoMsg`].
+//!
+//! This handler was refactored to fit that pattern: it now subscribes to
+//! [`IncomingDiscoMsg`] (decrypted packets) and [`Arc<PeerState>`] (peer-db
+//! snapshots used to map sender DiscoPublicKey → PeerId) instead of consuming
+//! the raw channel. The parse/decrypt step is no longer needed here — upstream
+//! already did it.
+//!
+//! # Magic bytes
+//!
+//! Upstream commit `87601a8` ("disco: set magic on packet encrypt") fixed
+//! [`Packet::encrypt_in_place`] to call `Header::new(...)`, which sets the magic
+//! bytes correctly. Before that fix, this handler had to manually pre-fill the
+//! magic bytes in [`build_pong`]; that workaround is now removed (it would write
+//! the same bytes twice).
 
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
@@ -18,103 +35,133 @@ use std::{
 };
 
 use crypto_box::aead::{AeadCore, OsRng};
-use ts_dataplane::async_tokio::{DataPlane, DiscoBatch, Rx};
-use ts_disco_protocol::{Encrypted, Header, MessageType, Packet, Ping, Pong};
+use kameo::{
+    actor::ActorRef,
+    message::{Context, Message},
+};
+use ts_dataplane::async_tokio::DataPlane;
+use ts_disco_protocol::{Header, MessageType, Packet, Ping, Pong};
 use ts_keys::{DiscoKeyPair, DiscoPublicKey};
 use ts_packet::PacketMut;
 use ts_transport::PeerId;
 
-use crate::peer_tracker::PeerDb;
+use crate::{
+    dataplane::IncomingDiscoMsg,
+    env::Env,
+    peer_tracker::{PeerDb, PeerState},
+    Error,
+};
 
 /// Type alias for the shared peer-db handle used by the disco handler.
 ///
 /// Mirrors the pattern in [`crate::multiderp::uniderp`]: `None` until the first
-/// [`crate::peer_tracker::PeerState`] update arrives.
+/// [`PeerState`] update arrives.
 type SharedPeerDb = Arc<RwLock<Option<Arc<PeerDb>>>>;
 
-/// Run the Disco handler loop, consuming batches from `disco_rx` until the channel
-/// closes (i.e. until the dataplane shuts down).
+/// Kameo actor that handles incoming Disco messages (Ping → Pong).
 ///
-/// For each incoming Disco Ping, a matching Pong is constructed, encrypted with this
-/// node's Disco private key, and sent back to the originating peer via the dataplane's
-/// underlay transports. Non-Ping Disco messages are logged at trace level and dropped.
-pub async fn run(
-    mut disco_rx: Rx<DiscoBatch>,
+/// Subscribes to:
+/// - [`IncomingDiscoMsg`] — decrypted Disco packets from [`crate::dataplane::DataplaneActor`]
+/// - [`Arc<PeerState>`] — peer-db snapshots for sender-key → PeerId routing
+///
+/// Spawned as a supervised child of [`crate::dataplane::DataplaneActor`] in its
+/// `on_start`. The disco keys and dataplane handle come from the parent; the
+/// peer_db is maintained internally from bus events.
+pub struct DiscoHandlerActor {
     disco_keys: DiscoKeyPair,
     peer_db: SharedPeerDb,
     dataplane: Arc<DataPlane>,
-) {
-    tracing::trace!("disco handler started");
+}
 
-    while let Some(batch) = disco_rx.recv().await {
-        for pkt in batch {
-            match handle_one(&pkt, &disco_keys, &peer_db) {
-                Ok(Some((peer_id, pong))) => {
-                    tracing::trace!(
-                        %peer_id,
-                        "disco Ping from peer — sending Pong"
-                    );
-                    dataplane.send_raw_to_underlay(peer_id, pong).await;
-                }
-                Ok(None) => {
-                    // Not a Ping (CallMeMaybe, future message types, etc.) or peer
-                    // not yet known. Nothing to send back.
-                }
-                Err(e) => {
-                    tracing::trace!(error = %e, "disco handler: skipping packet");
-                }
+impl kameo::Actor for DiscoHandlerActor {
+    type Args = (Env, DiscoKeyPair, Arc<DataPlane>);
+    type Error = Error;
+
+    async fn on_start(
+        (env, disco_keys, dataplane): Self::Args,
+        slf: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
+        // Decrypted Disco packets from the dataplane's bus publish.
+        env.subscribe::<IncomingDiscoMsg>(&slf).await?;
+        // Peer-state updates so we can map sender DiscoKey → PeerId.
+        env.subscribe::<Arc<PeerState>>(&slf).await?;
+
+        tracing::trace!("disco handler actor started");
+        Ok(Self {
+            disco_keys,
+            peer_db: Arc::new(RwLock::new(None)),
+            dataplane,
+        })
+    }
+}
+
+impl Message<IncomingDiscoMsg> for DiscoHandlerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: IncomingDiscoMsg,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        let pkt = msg.0.get(); // &Packet<Plaintext>
+        match handle_plaintext(pkt, &self.disco_keys, &self.peer_db) {
+            Ok(Some((peer_id, pong))) => {
+                tracing::trace!(%peer_id, "disco Ping from peer — sending Pong");
+                self.dataplane.send_raw_to_underlay(peer_id, pong).await;
+            }
+            Ok(None) => {
+                // Not a Ping (CallMeMaybe, future message types, etc.) or peer
+                // not yet known. Nothing to send back.
+            }
+            Err(e) => {
+                tracing::trace!(error = %e, "disco handler: skipping packet");
             }
         }
     }
-
-    tracing::trace!("disco handler stopped (channel closed)");
 }
 
-/// Result of handling a single incoming Disco packet.
+impl Message<Arc<PeerState>> for DiscoHandlerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        state: Arc<PeerState>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        // Replace the entire peer_db snapshot on each update.
+        if let Ok(mut slot) = self.peer_db.write() {
+            *slot = Some(state.peers.clone());
+        }
+    }
+}
+
+/// Result of handling a decrypted Disco packet.
 ///
 /// `Ok(Some((peer_id, pong_pkt)))` means the packet was a Ping from a known peer
 /// and a Pong response was constructed, ready to be sent to `peer_id`.
 /// `Ok(None)` means the packet needs no response (not a Ping, or peer unknown).
 type HandleResult = Result<Option<(PeerId, PacketMut)>, &'static str>;
 
-/// Parse, decrypt, and (if Ping) build a Pong for a single incoming Disco packet.
+/// Handle a decrypted Disco [`Packet<Plaintext>`]. If it's a Ping from a known
+/// peer, build a Pong response ready to route.
 ///
-/// Steps:
-/// 1. Parse the outer encrypted Disco [`Packet`] header to recover the sender's
-///    [`DiscoPublicKey`].
-/// 2. Decrypt the packet with our [`DiscoKeyPair`] private key.
-/// 3. If the decrypted message is a [`Ping`], look up the sender's [`PeerId`] in
-///    the shared [`PeerDb`] via the Disco key index.
-/// 4. Construct a [`Pong`] echoing the Ping's `tx_id`, encrypt it with our private
-///    key to the sender's public key, and return it ready to route.
-fn handle_one(pkt: &PacketMut, disco_keys: &DiscoKeyPair, peer_db: &SharedPeerDb) -> HandleResult {
-    // Quickly reject non-disco packets — the dataplane already classified this as
-    // Disco, but double-check the magic bytes before parsing.
-    if !ts_disco_protocol::is_disco_message(pkt.as_ref()) {
-        return Err("not a disco message (magic mismatch)");
-    }
-
-    // Copy into a mutable buffer for in-place decryption.
-    let mut buf: Vec<u8> = pkt.as_ref().to_vec();
-    let enc_pkt = Packet::<Encrypted>::from_encrypted_bytes_mut(&mut buf)
-        .map_err(|_| "failed to parse encrypted disco packet")?;
-
-    let sender_disco: DiscoPublicKey = *enc_pkt.sender_pubkey();
-
-    // Decrypt in place using our private disco key.
-    let dec_pkt = enc_pkt
-        .decrypt_in_place(&disco_keys.private)
-        .map_err(|_| "disco decrypt failed")?;
-
+/// Pre-merge, this was `handle_one(&PacketMut, ...)` which did parse + decrypt;
+/// upstream's #288 + #229 redesigns the dataplane to do parse + decrypt inline
+/// and publish the decrypted packet to the bus, so this function takes the
+/// post-decrypt shape directly.
+fn handle_plaintext(
+    pkt: &Packet<ts_disco_protocol::Plaintext>,
+    disco_keys: &DiscoKeyPair,
+    peer_db: &SharedPeerDb,
+) -> HandleResult {
     // Only Ping requires a response today.
-    if dec_pkt.ty() != Some(MessageType::Ping) {
-        tracing::trace!(ty = ?dec_pkt.ty(), "disco non-Ping message — dropping");
+    if pkt.ty() != Some(MessageType::Ping) {
+        tracing::trace!(ty = ?pkt.ty(), "disco non-Ping message — dropping");
         return Ok(None);
     }
 
-    let ping = dec_pkt
-        .as_msg::<Ping>()
-        .ok_or("failed to parse Ping payload")?;
+    let ping = pkt.as_msg::<Ping>().ok_or("failed to parse Ping payload")?;
+    let sender_disco: &DiscoPublicKey = pkt.sender_pubkey();
 
     // Look up the sender's PeerId via their DiscoPublicKey.
     let peer_id = {
@@ -123,7 +170,7 @@ fn handle_one(pkt: &PacketMut, disco_keys: &DiscoKeyPair, peer_db: &SharedPeerDb
             // PeerDb not yet populated (no control-plane state update yet).
             return Ok(None);
         };
-        let Some((id, _node)) = db.get(&sender_disco) else {
+        let Some((id, _node)) = db.get(sender_disco) else {
             tracing::trace!(
                 ?sender_disco,
                 "disco Ping from peer not in PeerDb — cannot route Pong",
@@ -133,13 +180,15 @@ fn handle_one(pkt: &PacketMut, disco_keys: &DiscoKeyPair, peer_db: &SharedPeerDb
         id
     };
 
-    // Construct and encrypt the Pong response.
-    let pong_pkt = build_pong(&ping.tx_id, disco_keys, &sender_disco)?;
+    let pong_pkt = build_pong(&ping.tx_id, disco_keys, sender_disco)?;
     Ok(Some((peer_id, pong_pkt)))
 }
 
 /// Build an encrypted [`Pong`] packet echoing the supplied `tx_id`, encrypted from
 /// `our_keys.private` to `their_disco`.
+///
+/// After upstream's #288 fix (`Packet::encrypt_in_place` now calls `Header::new`
+/// which sets magic correctly), no manual magic pre-fill is needed.
 fn build_pong(
     tx_id: &[u8; 12],
     our_keys: &DiscoKeyPair,
@@ -156,14 +205,9 @@ fn build_pong(
     let total = Packet::<ts_disco_protocol::Plaintext>::size_for_message(pong_size);
     let mut out = vec![0u8; total];
 
-    // Pre-fill the Header magic bytes. `init_from_bytes` reinterprets the buffer
-    // as a `Packet<Plaintext>` without touching the header fields, and
-    // `encrypt_in_place` sets `sender_pub` and `nonce` but not `magic`. Without
-    // this pre-fill, the magic stays zero and the receiver's
-    // `Packet::from_encrypted_bytes` rejects the packet with `WrongMagic`.
-    out[..Header::MAGIC.len()].copy_from_slice(&Header::MAGIC);
-
-    // Initialize the plaintext Pong payload.
+    // Initialize the plaintext Pong payload. init_from_bytes does not touch the
+    // header; encrypt_in_place (below) sets the entire header (magic, sender_pub,
+    // nonce) via Header::new() after upstream commit 87601a8.
     let pt = Packet::<ts_disco_protocol::Plaintext>::init_from_bytes::<Pong>(&mut out, |pong| {
         pong.tx_id = *tx_id;
         pong.src = unspecified.into();
@@ -185,9 +229,7 @@ fn build_pong(
 #[cfg(test)]
 mod test {
     use crypto_box::aead::{AeadCore, OsRng};
-    use ts_disco_protocol::{
-        Encrypted, Header, MessageType, Packet, Ping, Pong,
-    };
+    use ts_disco_protocol::{Encrypted, Header, MessageType, Packet, Ping, Pong};
     use ts_keys::{DiscoKeyPair, DiscoPublicKey};
 
     use super::build_pong;
@@ -204,7 +246,9 @@ mod test {
         let total = Packet::<ts_disco_protocol::Plaintext>::size_for_message(ping_size);
         let mut buf = vec![0u8; total];
 
-        // Pre-fill magic so the packet round-trips through from_encrypted_bytes.
+        // Pre-fill magic so the packet round-trips through from_encrypted_bytes
+        // (encrypt_in_place sets it via Header::new, but only after the init step
+        // reinterprets the buffer; the test needs the magic present up-front).
         buf[..Header::MAGIC.len()].copy_from_slice(&Header::MAGIC);
 
         let pt = Packet::<ts_disco_protocol::Plaintext>::init_from_bytes::<Ping>(&mut buf, |ping| {

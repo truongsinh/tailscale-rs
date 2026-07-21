@@ -20,6 +20,7 @@ num-traits = "0.2"
 num-derive = "0.4"
 
 ts_keys.workspace = true
+ts_hexdump.workspace = true
 
 [dev-dependencies]
 zerocopy = { workspace = true, features = ["std"] }

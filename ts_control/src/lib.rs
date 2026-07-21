@@ -17,20 +17,19 @@ pub const IPN_VERSION: &str = concat!(
     env!("TS_RS_BUILD_SHA"),
 );
 
+mod client;
 mod config;
 mod control_dialer;
 mod derp;
 mod dial_plan;
-#[cfg_attr(not(feature = "async_tokio"), expect(dead_code))]
 mod map_request_builder;
 mod node;
 mod run_identity;
 mod disk_identity;
-#[cfg(feature = "async_tokio")]
-mod tokio;
 
 use std::fmt;
 
+pub use client::{AsyncControlClient, FilterUpdate, PeerUpdate, StateUpdate};
 #[doc(inline)]
 pub use config::{Config, DEFAULT_CONTROL_SERVER};
 pub use control_dialer::{ControlDialer, TcpDialer, complete_connection};
@@ -40,9 +39,6 @@ pub use node::{
     Id as NodeId, Node, NodeLastSeen, NodeStatus, NodeUpdate, StableId as StableNodeId,
     TailnetAddress,
 };
-
-#[cfg(feature = "async_tokio")]
-pub use crate::tokio::{AsyncControlClient, FilterUpdate, PeerUpdate, StateUpdate};
 
 /// An error which occurred while connecting to the control server or control plane.
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]

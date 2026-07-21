@@ -40,11 +40,9 @@ tokio-util = { workspace = true, features = ["time"] }
 tracing.workspace = true
 url = { workspace = true, features = ["serde", "std"] }
 zerocopy.workspace = true
-
-# Required dependencies for the async_tokio feature.
-futures-util = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-tokio-stream = { version = "0.1", optional = true, default-features = false, features = ["sync"] }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 
 # Run-as identity + disk-free detection (see run_identity.rs / disk_identity.rs).
 [target.'cfg(unix)'.dependencies]
@@ -61,9 +59,6 @@ windows = { version = "0.62", features = [
 ] }
 
 [features]
-default = ["async_tokio"]
-async_tokio = ["dep:futures-util", "dep:tokio", "dep:tokio-stream"]
-
 # Allow derp connections to be made without verifying TLS certs. Only for use in tests.
 insecure-derp = ["ts_derp/insecure-for-tests"]
 # Allow control keys to be fetched over plain HTTP1 without TLS. Only for use in tests.

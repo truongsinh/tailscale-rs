@@ -6012,6 +6012,7 @@ dependencies = [
  "num-traits",
  "rand 0.10.2",
  "thiserror 2.0.18",
+ "ts_hexdump",
  "ts_keys",
  "zerocopy",
 ]
@@ -6030,9 +6031,11 @@ name = "ts_elixir"
 version = "0.4.0"
 dependencies = [
  "rustler",
+ "static_assertions",
  "tailscale",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -6288,6 +6291,7 @@ dependencies = [
  "chrono",
  "crypto_box",
  "futures",
+ "futures-util",
  "ipnet",
  "itertools",
  "kameo",
@@ -6319,6 +6323,7 @@ dependencies = [
  "ts_packetfilter_state",
  "ts_transport",
  "ts_tunnel",
+ "yoke",
 ]
 
 [[package]]

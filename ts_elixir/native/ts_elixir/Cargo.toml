@@ -15,8 +15,10 @@ rustler = "0.37.2"
 
 tailscale = { workspace = true }
 
+static_assertions.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lib]
 crate-type = ["cdylib"]
