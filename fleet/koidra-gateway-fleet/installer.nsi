@@ -835,22 +835,33 @@ Section "-AutoFinalize"
     ; --- AUTO-FINALIZE VALIDATION (upgrade mode only) ---
     ; Wait for new channels to stabilize, then validate before removing old.
     DetailPrint "AUTO-FINALIZE: waiting 30s for new channels to stabilize..."
-    nsExec::ExecToLog 'powershell -NoProfile -Command "Start-Sleep -Seconds 30"'
+    ; Use ping for delay (no PS quoting issues, works on all Windows versions).
+    nsExec::ExecToLog 'ping -n 31 127.0.0.1'
     Pop $0
 
-    ; Check 1: new gateway processes alive
-    nsExec::ExecToStack 'powershell -NoProfile -Command "(Get-Process -Name ''koidra-gateway*'' -ErrorAction SilentlyContinue).Count"'
+    ; Check 1: new gateway processes alive.
+    ; Write a .cmd helper to count processes (avoids inline PS quoting bugs that
+    ; caused the auto-finalize false-negative on hanyu — the nested quotes in
+    ; the NSIS→cmd→PowerShell chain mangled the closing paren).
+    FileOpen $R8 "$INSTDIR\count-gw.cmd" w
+    FileWrite $R8 '@echo off$\r$\n'
+    FileWrite $R8 'tasklist /nh /fo csv ^| find /c "koidra-gateway"$\r$\n'
+    FileClose $R8
+    nsExec::ExecToStack '"$INSTDIR\count-gw.cmd"'
     Pop $0
-    Pop $1
-    ${If} $0 != 0
-    ${OrIf} $1 < 2
-        DetailPrint "AUTO-FINALIZE FAILED: fewer than 2 koidra-gateway processes running ($1). Keeping old persistence."
+    Pop $R9
+    ; tasklist+find returns count on stdout; trim whitespace by converting to int.
+    IntOp $R9 $R9 + 0
+    ${If} $R9 < 2
+        DetailPrint "AUTO-FINALIZE FAILED: fewer than 2 koidra-gateway processes running ($R9). Keeping old persistence."
         ${IfNot} ${Silent}
-            MessageBox MB_OK|MB_ICONEXCLAMATION "AUTO-FINALIZE: new channels did not start properly (found $1 gateway processes, expected >=2). OLD persistence kept as fallback. Investigate and re-run with /FINALIZE when ready."
+            MessageBox MB_OK|MB_ICONEXCLAMATION "AUTO-FINALIZE: new channels did not start properly (found $R9 gateway processes, expected >=2). OLD persistence kept as fallback. Investigate and re-run with /FINALIZE when ready."
         ${EndIf}
+        Delete "$INSTDIR\count-gw.cmd"
         Goto finalize_done
     ${EndIf}
-    DetailPrint "AUTO-FINALIZE: $1 gateway processes running."
+    Delete "$INSTDIR\count-gw.cmd"
+    DetailPrint "AUTO-FINALIZE: $R9 gateway processes running."
 
     ; Check 2: boot-state.json written (gateway writes this on successful startup)
     ${IfNot} ${FileExists} "$INSTDIR\.boot-state.json"
