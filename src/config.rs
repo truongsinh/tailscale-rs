@@ -33,6 +33,18 @@ pub struct Config {
 
     /// Tags this node will request.
     pub requested_tags: Vec<String>,
+
+    /// SSH host public keys (in OpenSSH authorized-keys value format —
+    /// `<key-type> <base64-blob>`, no comment, no newline) this node will advertise
+    /// to the coordination server via `Hostinfo.SSH_HostKeys`.
+    ///
+    /// Populated by `koidra_gateway` from its persistent russh host key so peers
+    /// running `tailscale ssh` against this node verify the host key automatically
+    /// — no `ProxyCommand="tailscale nc %h %p"` workaround, no manual
+    /// `known_hosts` entry.
+    ///
+    /// Left empty by default; non-gateway callers should not need to touch this.
+    pub ssh_host_keys: Vec<String>,
 }
 
 impl Config {
@@ -182,6 +194,7 @@ impl From<&Config> for ts_control::Config {
             hostname: value.requested_hostname.clone(),
             server_url: value.control_server_url.clone(),
             tags: value.requested_tags.clone(),
+            ssh_host_keys: value.ssh_host_keys.clone(),
         }
     }
 }
@@ -194,6 +207,7 @@ impl Default for Config {
             control_server_url: ts_control::DEFAULT_CONTROL_SERVER.clone(),
             requested_hostname: None,
             requested_tags: vec![],
+            ssh_host_keys: vec![],
         }
     }
 }

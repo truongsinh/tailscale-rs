@@ -92,6 +92,17 @@ pub enum HostKeyError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Failed to encode the public half of the host key into the OpenSSH
+    /// authorized-keys string format used by `Hostinfo.SSH_HostKeys`. Should be
+    /// unreachable for Ed25519 — the only realistic trigger is a key type `russh`
+    /// doesn't know how to serialize, which would have failed earlier.
+    #[error("failed to encode host public key as OpenSSH string: {source}")]
+    EncodePublic {
+        /// Underlying encoding error from `ssh_key`.
+        #[source]
+        source: ssh_key::Error,
+    },
 }
 
 /// Load the persistent SSH host key at `path`, or generate + persist a new one.
@@ -147,7 +158,32 @@ pub async fn load_or_generate(path: &Path) -> Result<PrivateKey, HostKeyError> {
     }
 }
 
-/// Outcome of an attempt to write a freshly generated key.
+/// Format the public half of a persistent host key as the single-line OpenSSH
+/// authorized-keys value `tailscale ssh` clients expect in `Hostinfo.SSH_HostKeys`.
+///
+/// Returns a string of the form `<key-type> <base64-blob>` (e.g.
+/// `"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."`) with no comment, no leading
+/// hostname, and no trailing newline. This matches the format upstream Tailscale
+/// produces in `ssh/tailssh/hostkeys.go::getHostKeyPublicStrings` —
+/// `strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))` —
+/// so the coordination server and peer clients parse it identically.
+///
+/// Callers that need to advertise the host key (e.g. `koidra_gateway` registering
+/// with the coordination server) should call this once at startup, after
+/// [`load_or_generate`] returns the persistent key, and pass the result into
+/// [`crate::Config::ssh_host_keys`].
+pub fn public_openssh_string(key: &PrivateKey) -> Result<String, HostKeyError> {
+    let encoded = key
+        .public_key()
+        .to_openssh()
+        .map_err(|source| HostKeyError::EncodePublic { source })?;
+    // `PublicKey::to_openssh` never appends a trailing newline (it's the single-line
+    // authorized_keys value, not the SSH-format wrapping used by private keys), but
+    // trim defensively so a future russh/ssh_key revision can't silently break the
+    // wire format. Newlines inside the blob would also be caught here — the base64
+    // alphabet has no whitespace, so any present means the encoder changed shape.
+    Ok(encoded.trim().to_owned())
+}
 #[derive(Debug, Eq, PartialEq)]
 enum CreateOutcome {
     /// The file was created and now holds the encoded key.
@@ -311,5 +347,60 @@ mod tests {
             HostKeyError::Write { path: p, .. } => assert_eq!(p, path),
             other => panic!("expected Write error, got {other:?}"),
         }
+    }
+
+    /// `public_openssh_string` returns the wire format `Hostinfo.SSH_HostKeys` expects:
+    /// `<key-type> <base64>`, single-line, no comment, no trailing newline.
+    ///
+    /// This is the format `tailscale ssh` clients parse verbatim into known_hosts
+    /// (see `cmd/tailscale/cli/ssh.go::genKnownHosts` in tailscale/tailscale) — a
+    /// malformed value here means the SSH client refuses the host key on connect.
+    #[test]
+    fn public_openssh_string_matches_authorized_keys_value_format() {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let encoded = public_openssh_string(&key).unwrap();
+
+        // Wire-format invariants the client relies on.
+        assert!(
+            encoded.starts_with("ssh-ed25519 "),
+            "encoded host key must start with the key type, got {encoded:?}"
+        );
+        assert!(
+            !encoded.contains('\n') && !encoded.contains('\r'),
+            "encoded host key must be a single line, got {encoded:?}"
+        );
+        assert!(
+            !encoded.ends_with(' '),
+            "encoded host key must not have a trailing space, got {encoded:?}"
+        );
+
+        // Two whitespace-separated tokens only: key type + base64 blob. No comment.
+        let parts: Vec<&str> = encoded.split_whitespace().collect();
+        assert_eq!(
+            parts.len(),
+            2,
+            "encoded host key must be exactly `type SP base64`, got {encoded:?}"
+        );
+        assert_eq!(parts[0], "ssh-ed25519");
+        assert!(parts[1].starts_with("AAAA"), "base64 blob starts with the magic bytes");
+
+        // The serialized form must round-trip through `PublicKey::from_openssh`.
+        let reparsed = russh::keys::ssh_key::PublicKey::from_openssh(&encoded).unwrap();
+        assert_eq!(
+            key.public_key().fingerprint(ssh_key::HashAlg::Sha256),
+            reparsed.fingerprint(ssh_key::HashAlg::Sha256),
+            "reparsed public key fingerprint must match the original"
+        );
+    }
+
+    /// `public_openssh_string` produces the same value across calls on the same key —
+    /// no hidden state, no nondeterminism. Regression for "host key advertisement must
+    /// be stable so peers' known_hosts entries don't churn across MapRequests."
+    #[test]
+    fn public_openssh_string_is_stable_across_calls() {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let a = public_openssh_string(&key).unwrap();
+        let b = public_openssh_string(&key).unwrap();
+        assert_eq!(a, b, "public_openssh_string must be deterministic");
     }
 }
