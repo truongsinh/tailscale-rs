@@ -45,6 +45,8 @@ ts_control_serde.workspace = true
 insecure-for-tests = [
     "ts_tls_util/insecure"
 ]
+# Expose the in-process FakeServer harness to downstream integration tests.
+test-util = []
 
 [lints]
 workspace = true

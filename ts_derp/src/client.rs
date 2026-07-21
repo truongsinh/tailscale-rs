@@ -1,4 +1,8 @@
 use core::fmt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crypto_box::aead::{Aead, AeadCore, AeadMutInPlace, OsRng};
 use futures::{SinkExt, StreamExt};
@@ -10,7 +14,9 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use ts_http_util::Client as _;
 use ts_keys::{NodeKeyPair, NodePublicKey};
 use ts_packet::PacketMut;
-use ts_transport::{BatchRecvIter, BatchSendIter, UnderlayTransport};
+use ts_transport::{
+    BatchRecvIter, BatchSendIter, MapPeerKey, PeerLookup, UnderlayTransport, UnderlayTransportExt,
+};
 use url::Url;
 
 use crate::{
@@ -23,10 +29,39 @@ type DefaultIo = ts_http_util::Upgraded;
 /// Type alias for the default derp client over upgraded HTTP on a tokio executor.
 pub type DefaultClient = Client<DefaultIo>;
 
+/// Shared, monotonically increasing count of DERP frames received on a [`Client`] —
+/// frames of **any** type: server keepalives, pings, peer-gone notices, and peer data
+/// alike.
+///
+/// Standard DERP servers emit a KeepAlive at least every [`frame::KEEP_ALIVE`] seconds,
+/// so on a connection with a live return path this counter always advances even when no
+/// peer traffic flows. Total frame silence therefore indicates a dead return path —
+/// which is exactly how the runtime's rx-stall detection uses this handle
+/// (frame-silence predicate). The handle stays valid and cheap to read after the
+/// [`Client`] has been wrapped into other transport layers.
+#[derive(Clone, Debug, Default)]
+pub struct FrameActivity(Arc<AtomicU64>);
+
+impl FrameActivity {
+    /// Total number of frames received so far.
+    pub fn frames_received(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Record the arrival of a frame.
+    ///
+    /// Called by [`Client`] on every frame received; public so tests and alternative
+    /// transports can drive the same signal.
+    pub fn record(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Single-region DERP client.
 pub struct Client<Io> {
     read_conn: Mutex<FramedRead<ReadHalf<Io>, frame::Codec>>,
     write_conn: Mutex<FramedWrite<WriteHalf<Io>, frame::Codec>>,
+    frame_activity: FrameActivity,
 }
 
 /// Establish and upgrade a http connection to the derp region.
@@ -114,7 +149,44 @@ where
         Ok(Self {
             read_conn: Mutex::new(fr),
             write_conn: Mutex::new(fw),
+            frame_activity: FrameActivity::default(),
         })
+    }
+
+    /// A cloneable handle to this client's frame-arrival signal.
+    ///
+    /// The handle keeps working after the client is wrapped (e.g. via
+    /// [`ts_transport::UnderlayTransportExt::with_key_lookup`]), so callers can observe
+    /// frame arrival — keepalives included — without changing the peer-data semantics
+    /// of [`UnderlayTransport::recv`].
+    ///
+    /// Callers wrapping the client into a peer-keyed transport should prefer
+    /// [`Self::into_transport_with_activity`], which yields the transport and the
+    /// handle **together** so the two can never come from different clients.
+    pub fn frame_activity(&self) -> FrameActivity {
+        self.frame_activity.clone()
+    }
+
+    /// Consume the client into a peer-keyed transport plus **its own**
+    /// frame-arrival handle.
+    ///
+    /// The two are constructed together, in one place, from one client — so a
+    /// stall detector observing the handle while polling the transport can never
+    /// be wired to a handle belonging to a different (or freshly defaulted)
+    /// client. That wrong-handle bug would leave every healthy connection looking
+    /// frame-silent (all keepalives invisible) and false-fire stall detection on
+    /// the entire fleet; making it unrepresentable is the point of this API.
+    pub fn into_transport_with_activity<DstKey, Lookup>(
+        self,
+        lookup: Lookup,
+    ) -> (MapPeerKey<Self, Lookup, DstKey>, FrameActivity)
+    where
+        Io: Send,
+        Lookup: PeerLookup<NodePublicKey, DstKey> + PeerLookup<DstKey, NodePublicKey> + Send + Sync,
+        DstKey: Send + Sync + 'static,
+    {
+        let frames = self.frame_activity.clone();
+        (self.with_key_lookup(lookup), frames)
     }
 
     /// Send a message to a nodekey on the derp server.
@@ -162,6 +234,9 @@ where
                     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "derp stream ended")
                 })??
             };
+            // Every frame — control messages included — is proof the server-to-client
+            // path is alive; record it before dispatching on the frame type.
+            self.frame_activity.record();
             let frame = frame.get();
 
             match frame.header.typ {
@@ -303,5 +378,77 @@ where
 
     async fn recv(&self) -> impl BatchRecvIter<Self::PeerKey, Error = Self::Error> {
         [self.recv_one().await.map(|(k, pkt)| (k, [pkt]))]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::Client;
+    use crate::test_util::FakeServer;
+
+    async fn wait_for(mut cond: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("condition not reached within timeout");
+    }
+
+    /// Seam test for the frame-silence predicate's input signal: server KeepAlive
+    /// frames — which `recv_one` swallows without returning — must still advance the
+    /// [`FrameActivity`][super::FrameActivity] counter, while peer data keeps its
+    /// existing recv semantics.
+    #[tokio::test]
+    async fn keepalive_frames_advance_frame_activity_without_peer_data() {
+        let node_keys = ts_keys::NodeState::generate().node_keys;
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+
+        let (client, mut server) = tokio::join!(
+            async { Client::handshake(client_io, &node_keys).await.unwrap() },
+            FakeServer::handshake(server_io, &node_keys.public),
+        );
+        let activity = client.frame_activity();
+        assert_eq!(activity.frames_received(), 0, "no frames after handshake");
+
+        let client = Arc::new(client);
+        let recv_task = tokio::spawn({
+            let client = client.clone();
+            async move { client.recv_one().await }
+        });
+
+        // KeepAlives alone: the frame signal advances while recv_one keeps waiting
+        // for peer data.
+        server.send_keepalive().await;
+        server.send_keepalive().await;
+        wait_for(|| activity.frames_received() == 2).await;
+        assert!(
+            !recv_task.is_finished(),
+            "recv_one must not return on keepalives"
+        );
+
+        // Peer data still resolves recv_one, and counts as a frame too.
+        server.send_peer_packet(node_keys.public, b"hello").await;
+        let (src, pkt) = tokio::time::timeout(Duration::from_secs(5), recv_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(src, node_keys.public);
+        assert_eq!(pkt.as_ref(), b"hello");
+        assert_eq!(activity.frames_received(), 3);
+
+        // A subsequent Ping is answered with a Pong and also advances the signal.
+        server.send_ping([7u8; 8]).await;
+        let recv_task = tokio::spawn({
+            let client = client.clone();
+            async move { client.recv_one().await }
+        });
+        wait_for(|| activity.frames_received() == 4).await;
+        assert!(!recv_task.is_finished(), "ping is handled inline");
+        recv_task.abort();
     }
 }

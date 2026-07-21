@@ -27,9 +27,7 @@ use crate::{
 type StreamHandle = JoinHandle<
     Result<
         std::pin::Pin<Box<dyn futures::Stream<Item = Arc<StateUpdate>> + Send>>,
-        kameo::error::SendError<
-            kameo::message::StreamMessage<Arc<StateUpdate>, (), ()>,
-        >,
+        kameo::error::SendError<kameo::message::StreamMessage<Arc<StateUpdate>, (), ()>>,
     >,
 >;
 
@@ -191,14 +189,12 @@ impl ControlRunner {
             Ok((_client, stream)) => {
                 let handle = slf.attach_stream(stream.boxed(), (), ());
                 self.stream_handle = Some(handle);
-                self.earliest_reconnect_at =
-                    Some(now + RECONNECT_BACKOFF);
+                self.earliest_reconnect_at = Some(now + RECONNECT_BACKOFF);
                 tracing::info!("control stream re-established");
                 true
             }
             Err(e) => {
-                self.earliest_reconnect_at =
-                    Some(now + RECONNECT_BACKOFF);
+                self.earliest_reconnect_at = Some(now + RECONNECT_BACKOFF);
                 tracing::error!(
                     error = %e,
                     backoff_secs = RECONNECT_BACKOFF.as_secs(),
