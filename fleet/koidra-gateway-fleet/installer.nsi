@@ -676,7 +676,18 @@ Section "Start koidra-gateway channels" SecStart
             Pop $0
             DetailPrint "Admin: new PRIMARY started; both channels now on koidra-gateway."
         ${Else}
-            ; Fresh / repair / reprovision — no old stack; start both.
+            ; Fresh / repair / reprovision — start both.
+            ; Repair mode fix: old gateway processes may still be running (the
+            ; "no old stack" assumption was wrong for repair — the box has an
+            ; existing koidra-gateway install with live processes). Kill them
+            ; before starting new ones, otherwise port/identity conflict causes
+            ; the new processes to crash silently.
+            FileOpen $R8 "$INSTDIR\kill-old-gw.cmd" w
+            FileWrite $R8 '@echo off$\r$\n'
+            FileWrite $R8 'for /f "tokens=2" %%p in ('tasklist /nh /fo csv ^| findstr /i "koidra-gateway"') do taskkill /f /pid %%p 2>nul$\r$\n'
+            FileClose $R8
+            nsExec::ExecToLog '"$INSTDIR\kill-old-gw.cmd"'
+            Delete "$INSTDIR\kill-old-gw.cmd"
             nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-backup"'
             Pop $0
             nsExec::ExecToLog 'schtasks /run /tn "KoidraGateway-primary"'
