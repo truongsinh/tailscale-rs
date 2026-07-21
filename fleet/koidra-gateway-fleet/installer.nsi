@@ -81,18 +81,18 @@
 !include "x64.nsh"
 !include "FileFunc.nsh"   ; GetParameters / GetOptions
 !include "TextFunc.nsh"   ; TrimNewLines (read the pointer file's exe name cleanly)
+!include "nsDialogs.nsh"  ; Auth-key prompt dialog (interactive fresh-install UX)
 
 Name "Koidra Gateway"
 OutFile "koidra-gateway-setup.exe"
 Unicode True
 ShowInstDetails show
-; Auto-elevate via UAC application manifest. This ensures the installer ALWAYS
-; runs with admin privileges → scheduled tasks are ALWAYS created (SYSTEM, onstart,
-; persistent). Without this, a non-elevated double-click falls to the non-admin
-; path (Startup shortcut, no tasks, non-persistent) — the root cause of bioverbeek
-; and redsun-win10 ending up with no tasks after install. On non-admin boxes the
-; operator must run from an elevated cmd prompt (runas /user:Administrator).
-RequestExecutionLevel admin
+; Operator must right-click → Run as administrator. We do NOT use RequestExecutionLevel
+; admin because auto-elevation via UAC manifest strips the command-line args (/AUTHKEY=)
+; and env vars at the elevation boundary — the elevated process doesn't inherit them.
+; When the operator manually elevates (right-click → Run as admin), args/env ARE
+; preserved. This is the documented NSIS/Windows behavior.
+RequestExecutionLevel user
 
 ; The staged versioned binary name. Overridable at build time (-DGW_SHA=<sha>).
 ; This name IS the process image AND the pointer-file content AND what the
@@ -122,10 +122,14 @@ Var LocalAppDir   ; %LOCALAPPDATA%  (via ReadEnvStr)
 Var BaseDir       ; ProgramData (admin) or LocalAppData (non-admin)
 Var OldDir        ; <BaseDir>\koidra-ssh
 Var Mode          ; "upgrade" | "fresh" | "repair" | "reprovision"
+Var AuthKey       ; /AUTHKEY= CLI flag (universal belt-and-suspenders fallback)
+Var AuthKeyField  ; nsDialogs text field handle (interactive auth-key prompt)
+Var AuthKeyPageShown  ; "1" if the auth-key page was displayed
 
 ; Directory is COMPUTED from the detected layout — never operator-chosen (a wrong
 ; dir loses identity). So no MUI_PAGE_DIRECTORY / COMPONENTS.
 !insertmacro MUI_PAGE_WELCOME
+Page custom AuthKeyPageCreate AuthKeyPageLeave
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_LANGUAGE "English"
@@ -136,8 +140,19 @@ Function .onInit
     StrCpy $Reprovision 0
     StrCpy $ConsoleAck 0
     StrCpy $StageOnly 0
+    StrCpy $AuthKey ""
+    StrCpy $AuthKeyPageShown "0"
 
     ${GetParameters} $R0
+
+    ; /AUTHKEY= — operator-supplied auth key (belt-and-suspenders fallback for ALL
+    ; modes). Written to authkey.txt if no existing non-empty key is found.
+    ClearErrors
+    ${GetOptions} $R0 "/AUTHKEY=" $R1
+    ${IfNot} ${Errors}
+    ${AndIf} $R1 != ""
+        StrCpy $AuthKey $R1
+    ${EndIf}
 
     ; /FINALIZE — persistence-removal pass only (§7). No install, no identity, no
     ; new tasks; just remove the OLD persistence after external validation.
@@ -258,6 +273,56 @@ Function .onInit
         SetShellVarContext all
     ${Else}
         SetShellVarContext current
+    ${EndIf}
+FunctionEnd
+
+; --------------------------------------------------------------------------- ;
+; Auth-key prompt page (interactive fresh/repair mode).
+Function AuthKeyPageCreate
+    StrCpy $AuthKeyPageShown "0"
+    ${If} $Mode == "upgrade"
+        Abort
+    ${EndIf}
+    ${If} $AuthKey != ""
+        Abort
+    ${EndIf}
+    ${If} $Mode == "repair"
+    ${AndIf} ${FileExists} "$INSTDIR\authkey.txt"
+        ClearErrors
+        FileOpen $0 "$INSTDIR\authkey.txt" r
+        ${IfNot} ${Errors}
+            FileSeek $0 0 END $1
+            FileClose $0
+            ${If} $1 > 0
+                Abort
+            ${EndIf}
+        ${EndIf}
+    ${EndIf}
+    nsDialogs::Create 1018
+    Pop $0
+    ${If} $0 == error
+        Abort
+    ${EndIf}
+    ${NSD_CreateLabel} 0 0 100% 36u "Tailscale provisioning auth key for this box.$\r$\nMint one from the Tailscale admin console (Settings -> Keys), or use the per-box key from the cheat-sheet."
+    Pop $0
+    ${NSD_CreateText} 0 40u 100% 12u ""
+    Pop $AuthKeyField
+    StrCpy $AuthKeyPageShown "1"
+    nsDialogs::Show
+FunctionEnd
+
+Function AuthKeyPageLeave
+    ${If} $AuthKeyPageShown == "1"
+        ${NSD_GetText} $AuthKeyField $AuthKey
+    ${EndIf}
+    ${If} $AuthKey == ""
+        MessageBox MB_ICONEXCLAMATION "A Tailscale auth key is required. Enter one or re-run with /AUTHKEY=<key>."
+        Abort
+    ${EndIf}
+    StrCpy $0 $AuthKey 11
+    ${If} $0 != "tskey-auth-"
+        MessageBox MB_ICONEXCLAMATION "The auth key should start with 'tskey-auth-'. Please check the key and re-enter."
+        Abort
     ${EndIf}
 FunctionEnd
 
@@ -594,7 +659,13 @@ Section "Koidra Gateway (required)" SecCore
             ${EndIf}
         ${EndIf}
         ${If} $6 == 0
-            ${If} ${FileExists} "$EXEDIR\authkey.txt"
+            ; /AUTHKEY= CLI flag takes priority (belt-and-suspenders).
+            ${If} $AuthKey != ""
+                FileOpen $3 "$INSTDIR\authkey.txt" w
+                FileWrite $3 "$AuthKey"
+                FileClose $3
+                DetailPrint "Auth key: baked from /AUTHKEY= CLI flag (fresh/repair)."
+            ${ElseIf} ${FileExists} "$EXEDIR\authkey.txt"
                 CopyFiles /SILENT "$EXEDIR\authkey.txt" "$INSTDIR\authkey.txt"
             ${Else}
                 ReadEnvStr $2 "KOIDRA_PRIMARY_AUTHKEY"
