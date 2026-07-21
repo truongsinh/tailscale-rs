@@ -154,9 +154,9 @@ mod tests {
         let cases = [
             Case {
                 desc: "exactly half free rounds to 50%",
-                free: 500 * 1024 * 1024 * 1024,
+                free: 512 * 1024 * 1024 * 1024,
                 total: 1024 * 1024 * 1024 * 1024,
-                expected: "disk=50%/500GB",
+                expected: "disk=50%/512GB",
             },
             Case {
                 desc: "sub-GB remainder rounds up to 1GB (div_ceil)",
