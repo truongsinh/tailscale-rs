@@ -345,22 +345,37 @@ async fn run_channel_loop(mut channel: russh::Channel<Msg>) {
         // stdin drops here → child sees EOF
     });
 
+    // Race the client-side mpsc against child.wait() so that a child exiting
+    // before the client signals Eof still drives the channel-close sequence.
+    // See examples/koidra_gateway/main.rs for the full rationale.
     let mut exit_seen: Option<u32> = None;
+    let mut child_exit_code: Option<u32> = None;
     loop {
-        let Some(msg) = channel.wait().await else { break };
-        match msg {
-            russh::ChannelMsg::Data { data }
-                if stdin_tx.send(data.to_vec()).is_err() =>
-            {
+        tokio::select! {
+            msg = channel.wait() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    russh::ChannelMsg::Data { data }
+                        if stdin_tx.send(data.to_vec()).is_err() =>
+                    {
+                        break;
+                    }
+                    russh::ChannelMsg::Data { .. } => {}
+                    russh::ChannelMsg::Eof => break,
+                    russh::ChannelMsg::ExitStatus { exit_status } => {
+                        exit_seen = Some(exit_status);
+                    }
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            status = child.wait() => {
+                child_exit_code = Some(match status {
+                    Ok(s) => s.code().unwrap_or(128) as u32,
+                    Err(_) => 128,
+                });
                 break;
             }
-            russh::ChannelMsg::Data { .. } => {}
-            russh::ChannelMsg::Eof => break,
-            russh::ChannelMsg::ExitStatus { exit_status } => {
-                exit_seen = Some(exit_status);
-            }
-            russh::ChannelMsg::Close => break,
-            _ => {}
         }
     }
     drop(stdin_tx);
@@ -368,10 +383,14 @@ async fn run_channel_loop(mut channel: russh::Channel<Msg>) {
     drop(stdout_task.await);
     drop(stderr_task.await);
 
-    let status = child.wait().await.ok();
-    let code = exit_seen
-        .or_else(|| status.and_then(|s| s.code().map(|c| c as u32)))
-        .unwrap_or(128);
+    let code = if let Some(c) = child_exit_code.or(exit_seen) {
+        c
+    } else {
+        match child.wait().await {
+            Ok(s) => s.code().unwrap_or(128) as u32,
+            Err(_) => 128,
+        }
+    };
     drop(channel.exit_status(code).await);
     drop(channel.eof().await);
     drop(channel.close().await);

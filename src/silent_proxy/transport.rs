@@ -92,7 +92,18 @@ impl ListenEndpoint {
     /// Default endpoint for the host platform.
     #[cfg(unix)]
     pub fn platform_default() -> Self {
-        ListenEndpoint::Unix(PathBuf::from("/run/tailscale-koidra-proxy.sock"))
+        // /run/ requires root on most Linux distros. Non-root users (e.g. user
+        // deployments like vn-office-dev-server) get "Permission denied" when
+        // the proxy tries to bind the socket. Detect non-root via the USER env
+        // var and fall back to /tmp which is world-writable. The operator can
+        // always override with an explicit --silent-proxy <path> argument.
+        let is_root = std::env::var("USER").unwrap_or_default() == "root"
+            || std::env::var("LOGNAME").unwrap_or_default() == "root";
+        if is_root {
+            ListenEndpoint::Unix(PathBuf::from("/run/tailscale-koidra-proxy.sock"))
+        } else {
+            ListenEndpoint::Unix(PathBuf::from("/tmp/koidra-tailnet-proxy.sock"))
+        }
     }
 
     /// Default endpoint for the host platform.

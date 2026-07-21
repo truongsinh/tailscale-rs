@@ -126,20 +126,19 @@ migrate_channel() {
         chmod 0755 "$NEW_DIR/run.sh"
     fi
 
-    # Install the new systemd unit (primary → port 2222, backup → 2223).
-    local port
-    case "$channel" in
-        primary) port=2222 ;;
-        backup)  port=2223 ;;
-    esac
-    # The shipped .service files use /opt/koidra-gateway + default ports —
-    # if the box uses a different layout, override via env vars.
+    # Install the new systemd unit. Both channels use port 22: each channel
+    # is its own tailnet IP, so there's no conflict with the real tailscale
+    # daemon or between channels. The old koidra-ssh unit may have port 2222
+    # (primary) or 2223 (backup) baked in — replace both with 22.
     cp -f "/etc/systemd/system/.pre-rebrand/koidra-ssh-$channel.service" \
           "/etc/systemd/system/koidra-gateway-$channel.service"
     sed -i \
         -e "s|koidra-ssh-$channel|koidra-gateway-$channel|g" \
         -e "s|/opt/koidra-ssh|/opt/koidra-gateway|g" \
         -e "s|Description=.*|Description=Koidra Gateway — $channel channel|" \
+        -e "s|--listen-port 2222|--listen-port 22|g" \
+        -e "s|--listen-port 2223|--listen-port 22|g" \
+        -e "s|run\.sh \(primary\|backup\) 222[23]|run.sh \1 22|g" \
         "/etc/systemd/system/koidra-gateway-$channel.service"
     systemctl daemon-reload
     systemctl enable "koidra-gateway-$channel.service"
