@@ -6286,6 +6286,7 @@ name = "ts_runtime"
 version = "0.4.0"
 dependencies = [
  "chrono",
+ "crypto_box",
  "futures",
  "ipnet",
  "itertools",
@@ -6307,6 +6308,7 @@ dependencies = [
  "ts_control",
  "ts_dataplane",
  "ts_derp",
+ "ts_disco_protocol",
  "ts_keys",
  "ts_netcheck",
  "ts_netmon",

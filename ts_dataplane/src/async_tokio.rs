@@ -292,6 +292,20 @@ impl DataPlane {
         let core = self.core_state.lock().await;
         tokio::sync::MutexGuard::map(core, |x| &mut x.sync)
     }
+
+    /// Send a raw (non-WireGuard-encrypted) packet to a peer via the underlay transport.
+    ///
+    /// This bypasses the normal WireGuard encryption path in [`DataPlane::process_outbound`],
+    /// routing a pre-formed packet directly via the underlay router. It is used for Disco
+    /// protocol responses (e.g. Pong) that ride on the same underlay transports as WireGuard
+    /// traffic but are not themselves WireGuard-encrypted.
+    ///
+    /// If no underlay transport is known for `peer_id`, the packet is silently dropped.
+    pub async fn send_raw_to_underlay(&self, peer_id: PeerId, packet: PacketMut) {
+        let core = self.core_state.lock().await;
+        let to_peers = core.sync.ur_out.route([(peer_id, vec![packet])]);
+        write_to_underlay(&core, to_peers).await;
+    }
 }
 
 async fn write_to_overlay(slf: &CoreState, packets: HashMap<OverlayTransportId, Vec<PacketMut>>) {
