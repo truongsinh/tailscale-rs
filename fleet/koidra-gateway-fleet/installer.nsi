@@ -109,6 +109,7 @@ VIAddVersionKey "ProductVersion" "0.4.0.254"
 
 Var IsAdmin       ; "1" if the current token is elevated
 Var Finalize      ; "1" if launched with /FINALIZE (persistence-removal pass only)
+Var StageOnly     ; "1" if launched with /STAGE-ONLY (skip auto-finalize, keep old persistence)
 Var Reprovision   ; "1" if launched with /REPROVISION (operator escape hatch: force
                   ;     fresh-provision on an existing net-new/lab koidra-gateway dir)
 Var ConsoleAck    ; "1" if launched with /CONSOLE (bypass the best-effort over-SSH guard)
@@ -130,6 +131,7 @@ Function .onInit
     StrCpy $Finalize 0
     StrCpy $Reprovision 0
     StrCpy $ConsoleAck 0
+    StrCpy $StageOnly 0
 
     ${GetParameters} $R0
 
@@ -139,6 +141,15 @@ Function .onInit
     ${GetOptions} $R0 "/FINALIZE" $R1
     ${IfNot} ${Errors}
         StrCpy $Finalize 1
+    ${EndIf}
+
+    ; /STAGE-ONLY — skip auto-finalize. The installer stages + starts new
+    ; channels but does NOT remove old persistence (the old two-phase pattern).
+    ; Useful for automated fleet rolls that want external verify-first.
+    ClearErrors
+    ${GetOptions} $R0 "/STAGE-ONLY" $R1
+    ${IfNot} ${Errors}
+        StrCpy $StageOnly 1
     ${EndIf}
 
     ; /REPROVISION — operator escape hatch (§11). Forces the fresh-provision path
@@ -797,14 +808,65 @@ Section "Start koidra-gateway channels" SecStart
 SectionEnd
 
 ; --------------------------------------------------------------------------- ;
-Section "-TwoPhaseReminder"
-    ; §7: old persistence is intentionally LEFT INTACT this run.
-    DetailPrint "TWO-PHASE: old KoidraSSH-* tasks / KoidraSSH.lnk LEFT INTACT as boot fallback."
-    DetailPrint "After EXTERNAL validation, run: koidra-gateway-setup.exe /FINALIZE  to remove old persistence."
-    DetailPrint "koidra-gateway installed and started; OLD koidra-ssh persistence left intact as boot fallback (run /FINALIZE after external validation)."
-    ${IfNot} ${Silent}
-        MessageBox MB_OK "koidra-gateway installed and started.$\n$\nThe OLD koidra-ssh persistence (tasks / Startup shortcut) and directory are LEFT INTACT as the boot fallback.$\n$\nAfter the coordinator's external validation passes (nodeId + IP + clientVersion unchanged, real SSH banner+exec, rx advancing), run:$\n    koidra-gateway-setup.exe /FINALIZE$\nto remove the old persistence. Directory deletion is a separate coordinator pass."
+Section "-AutoFinalize"
+    ; §7 (REVISED): auto-finalize replaces the old two-phase pattern. The installer
+    ; stages + starts new channels, waits for them to stabilize, validates they're
+    ; healthy, then auto-removes old persistence. /STAGE-ONLY skips this for the
+    ; manual verify-first pattern. /FINALIZE still works as a standalone persistence-
+    ; removal pass for the old workflow.
+    ${If} $StageOnly == 1
+        DetailPrint "STAGE-ONLY: old persistence left intact (operator will verify + run /FINALIZE manually)."
+        ${IfNot} ${Silent}
+            MessageBox MB_OK "koidra-gateway installed and started (STAGE-ONLY).$\n$\nOld persistence is LEFT INTACT. After external validation, run:$\n    koidra-gateway-setup.exe /FINALIZE"
+        ${EndIf}
+        Goto finalize_done
     ${EndIf}
+
+    ${If} $Mode != "upgrade"
+        ; Fresh/repair/reprovision have no old persistence to remove.
+        DetailPrint "AUTO-FINALIZE: mode=$Mode — no old persistence to remove. Install complete."
+        Goto finalize_done
+    ${EndIf}
+
+    ; --- AUTO-FINALIZE VALIDATION (upgrade mode only) ---
+    ; Wait for new channels to stabilize, then validate before removing old.
+    DetailPrint "AUTO-FINALIZE: waiting 30s for new channels to stabilize..."
+    nsExec::ExecToLog 'powershell -NoProfile -Command "Start-Sleep -Seconds 30"'
+    Pop $0
+
+    ; Check 1: new gateway processes alive
+    nsExec::ExecToStack 'powershell -NoProfile -Command "(Get-Process -Name ''koidra-gateway*'' -ErrorAction SilentlyContinue).Count"'
+    Pop $0
+    Pop $1
+    ${If} $0 != 0
+    ${OrIf} $1 < 2
+        DetailPrint "AUTO-FINALIZE FAILED: fewer than 2 koidra-gateway processes running ($1). Keeping old persistence."
+        ${IfNot} ${Silent}
+            MessageBox MB_OK|MB_ICONEXCLAMATION "AUTO-FINALIZE: new channels did not start properly (found $1 gateway processes, expected >=2). OLD persistence kept as fallback. Investigate and re-run with /FINALIZE when ready."
+        ${EndIf}
+        Goto finalize_done
+    ${EndIf}
+    DetailPrint "AUTO-FINALIZE: $1 gateway processes running."
+
+    ; Check 2: boot-state.json written (gateway writes this on successful startup)
+    ${IfNot} ${FileExists} "$INSTDIR\.boot-state.json"
+        DetailPrint "AUTO-FINALIZE FAILED: .boot-state.json not written — gateway may not have registered on tailnet. Keeping old persistence."
+        ${IfNot} ${Silent}
+            MessageBox MB_OK|MB_ICONEXCLAMATION "AUTO-FINALIZE: .boot-state.json was not written — the gateway may not have registered on the tailnet. OLD persistence kept as fallback."
+        ${EndIf}
+        Goto finalize_done
+    ${EndIf}
+    DetailPrint "AUTO-FINALIZE: .boot-state.json present — gateway registered."
+
+    ; All checks passed — auto-finalize (remove old persistence).
+    DetailPrint "AUTO-FINALIZE: validation PASSED — removing old koidra-ssh persistence..."
+    Call DoFinalize
+    DetailPrint "AUTO-FINALIZE: old persistence removed. Install complete (single-run)."
+    ${IfNot} ${Silent}
+        MessageBox MB_OK "koidra-gateway installed, validated, and finalized in a single run.$\n$\nOld persistence has been removed. The new koidra-gateway channels are running and registered on the tailnet."
+    ${EndIf}
+
+    finalize_done:
 SectionEnd
 
 ; --------------------------------------------------------------------------- ;
