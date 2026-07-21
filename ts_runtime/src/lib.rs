@@ -16,6 +16,7 @@ use crate::{
 pub mod control_runner;
 mod dataplane;
 mod derp_latency;
+mod disco_handler;
 mod env;
 mod error;
 mod multiderp;
