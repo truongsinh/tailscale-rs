@@ -67,37 +67,48 @@ set "PORT=%~2"
 if "%CHAN%"=="" set "CHAN=primary"
 if "%PORT%"=="" set "PORT=22"
 
-rem ---- resolve the binary -------------------------------------------------- rem
-rem Order: hardcoded literal (last resort) < installer-baked default pointer <
-rem authoritative current pointer < explicit override arg.
+rem ---- resolve binary is INSIDE :loop (see resolve_exe label below) -------- rem
+rem The binary pointer is re-read on EVERY loop iteration so the in-process
+rem updater's atomic swap of current-koidra-gateway.txt is picked up immediately
+rem after the updater exits. The previous layout resolved EXE once at cmd.exe
+rem startup (before :loop), which cached the OLD binary path for the lifetime of
+rem the cmd.exe process → the updater's swap was invisible → the new binary never
+rem ran. Verified 2026-07-21 (see REGRESSION-HANDOFF.md §1).
 rem
-rem ENCODING FIX: use `for /f ... in ('type ...')` instead of `set /p` to read
-rem pointer files. The `type` command converts UTF-16LE/BOM to ANSI on Windows;
-rem `set /p` reads raw bytes → a UTF-16 BOM (FF FE) becomes part of the filename
-rem → the resolved exe path is garbage → the gateway never launches. This was the
-rem root cause of the redsun-win10/ayo start-step failure: the operator's
-rem PowerShell `>` redirection wrote the pointer in UTF-16LE.
-set "EXE=%DIR%\koidra-gateway-06f9a3a.exe"
-
-if exist "%DIR%\default-koidra-gateway.txt" (
-    for /f "usebackq delims=" %%D in (`type "%DIR%\default-koidra-gateway.txt" 2^>nul`) do set "DEF=%%D"
-    if not "!DEF!"=="" set "EXE=%DIR%\!DEF!"
-)
-
-if exist "%DIR%\current-koidra-gateway.txt" (
-    for /f "usebackq delims=" %%T in (`type "%DIR%\current-koidra-gateway.txt" 2^>nul`) do set "TARGET=%%T"
-    if not "!TARGET!"=="" set "EXE=%DIR%\!TARGET!"
-)
-
-if not "%~3"=="" set "EXE=%DIR%\%~3"
+rem Command-line override (%3) STILL wins per iteration and is stable across
+rem loops (cmd.exe args don't change), so an explicit override pin is honored.
 
 rem ---- console node name (stable across the rebrand) ---------------------- rem
 set "TS_HOSTNAME=%COMPUTERNAME%-%CHAN%"
+
+rem ---- override arg is stable across iterations; capture once -------------- rem
+set "OVERRIDE=%~3"
 
 set "FASTFAILS=0"
 
 rem ======================== SUPERVISE LOOP ================================= rem
 :loop
+    rem ---- resolve_exe: re-read pointer files EVERY iteration -------------- rem
+    rem Order: hardcoded literal (last resort) < installer-baked default pointer
+    rem < authoritative current pointer < explicit override arg (%3, captured
+    rem once as OVERRIDE above since cmd.exe args don't change across :loop).
+    rem
+    rem ENCODING FIX: use `for /f ... in ('type ...')` instead of `set /p` to
+    rem read pointer files. `type` converts UTF-16LE/BOM to ANSI on Windows;
+    rem `set /p` reads raw bytes → a UTF-16 BOM becomes part of the filename.
+    set "EXE=%DIR%\koidra-gateway-06f9a3a.exe"
+    set "DEF="
+    if exist "%DIR%\default-koidra-gateway.txt" (
+        for /f "usebackq delims=" %%D in (`type "%DIR%\default-koidra-gateway.txt" 2^>nul`) do set "DEF=%%D"
+        if not "!DEF!"=="" set "EXE=%DIR%\!DEF!"
+    )
+    set "TARGET="
+    if exist "%DIR%\current-koidra-gateway.txt" (
+        for /f "usebackq delims=" %%T in (`type "%DIR%\current-koidra-gateway.txt" 2^>nul`) do set "TARGET=%%T"
+        if not "!TARGET!"=="" set "EXE=%DIR%\!TARGET!"
+    )
+    if not "%OVERRIDE%"=="" set "EXE=%DIR%\%OVERRIDE%"
+
     rem ---- auth key guard (H2): never launch `-k <empty>` (arg-parse crash). rem
     rem run.sh aborts loudly on an unset/empty AUTHKEY; the Windows loop instead
     rem diagnoses + backs off (so a key staged later self-heals) and NEVER dips
