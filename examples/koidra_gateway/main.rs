@@ -305,22 +305,51 @@ async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
         // stdin drops here → child sees EOF on stdin
     });
 
+    // Drive the session until ANY of:
+    //   - the client sends Eof / Close (client-initiated teardown),
+    //   - the child process exits (we must report its status and close),
+    //   - the channel mpsc is exhausted (channel.wait() returns None).
+    //
+    // Pre-fix bug: the loop only watched channel.wait() for teardown signals.
+    // When the child exited before the client signalled Eof (the common case
+    // for any non-trivial command and every interactive shell), the server
+    // stayed stuck in channel.wait(), the client stayed blocked waiting for
+    // SSH_MSG_CHANNEL_EOF / exit-status, and the session wedged until the TCP
+    // connection timed out. Racing child.wait() in the same select! breaks the
+    // deadlock: whichever side tears down first, the loop exits and we send
+    // the channel-close sequence.
+    //
+    // tokio::process::Child::wait is cancel-safe per its docs and idempotent
+    // after completion (subsequent calls return the cached ExitStatus), so it
+    // is safe to poll it inside select! on every loop iteration.
     let mut exit_seen: Option<u32> = None;
+    let mut child_exit_code: Option<u32> = None;
     loop {
-        let Some(msg) = channel.wait().await else { break };
-        match msg {
-            ChannelMsg::Data { data }
-                if stdin_tx.send(data.to_vec()).is_err() =>
-            {
+        tokio::select! {
+            msg = channel.wait() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    ChannelMsg::Data { data }
+                        if stdin_tx.send(data.to_vec()).is_err() =>
+                    {
+                        break;
+                    }
+                    ChannelMsg::Data { .. } => {}
+                    ChannelMsg::Eof => break,
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        exit_seen = Some(exit_status);
+                    }
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            status = child.wait() => {
+                child_exit_code = Some(match status {
+                    Ok(s) => s.code().unwrap_or(128) as u32,
+                    Err(_) => 128,
+                });
                 break;
             }
-            ChannelMsg::Data { .. } => {}
-            ChannelMsg::Eof => break,
-            ChannelMsg::ExitStatus { exit_status } => {
-                exit_seen = Some(exit_status);
-            }
-            ChannelMsg::Close => break,
-            _ => {}
         }
     }
     drop(stdin_tx);
@@ -328,11 +357,16 @@ async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
     drop(stdout_task.await);
     drop(stderr_task.await);
 
-    let status = child.wait().await;
-    let code = match (exit_seen, status) {
-        (Some(c), _) => c,
-        (None, Ok(s)) => s.code().unwrap_or(128) as u32,
-        (None, Err(_)) => 128,
+    // If the client-side path broke the loop before the child exited, we still
+    // need to wait so we report a real status. If the child.wait() branch fired,
+    // child_exit_code is set and we skip the second wait.
+    let code = if let Some(c) = child_exit_code.or(exit_seen) {
+        c
+    } else {
+        match child.wait().await {
+            Ok(s) => s.code().unwrap_or(128) as u32,
+            Err(_) => 128,
+        }
     };
     tracing::info!(channel = %channel_id, exit_status = code, "session finished");
     drop(channel.exit_status(code).await);
