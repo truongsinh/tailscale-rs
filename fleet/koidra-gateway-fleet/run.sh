@@ -5,7 +5,7 @@
 # Exec'd by the systemd unit (koidra-gateway-primary.service / -backup.service) as:
 #   run.sh <channel> <port> [exe-override]
 #     <channel>  = primary | backup
-#     <port>     = 2222 (primary) | 2223 (backup)   — dev ports
+#     <port>     = 22 (both channels; each channel is its own tailnet IP)
 #     [override] = optional explicit versioned binary name (rollout version pins)
 #
 # `exec` replaces the shell so systemd's Restart=on-failure sees the binary's

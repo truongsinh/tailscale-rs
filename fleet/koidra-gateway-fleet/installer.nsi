@@ -323,7 +323,36 @@ Section "Koidra Gateway (required)" SecCore
     File "extract-authkey.ps1"
     File "stop-old-stack.ps1"
     File "check-console.ps1"
-    File /oname=${BIN_VERSIONED} "${BIN_SRC}"
+
+    ; ---- BINARY STAGING — rename-and-replace (Issue #5) ------------------ ;
+    ; RCA (knodt 30h freeze): the OLD installer extracted the binary directly
+    ; to the versioned name via `File /oname=...`. When the SAME version is
+    ; reinstalled while the process is running, NSIS `File` opens the target
+    ; with GENERIC_WRITE — which FAILS on a locked running .exe. Worse, the
+    ; cmd-based `copy /Y` variant in the legacy installer would hang on the
+    ; locked file indefinitely while the watchdog relaunch cycle recreated
+    ; the process in the gap between kill and copy.
+    ;
+    ; Fix: extract to a `.tmp` side-car, then rename-and-replace. On Windows
+    ; NTFS you CAN rename a running .exe (the process holds a file handle, not
+    ; a name pin); you just cannot overwrite one. So:
+    ;   1. Extract new binary as ${BIN_VERSIONED}.tmp (always safe — new file).
+    ;   2. Clear any stale ${BIN_VERSIONED}.old from a prior install.
+    ;   3. If the running ${BIN_VERSIONED} exists, rename it aside to .old
+    ;      (succeeds even while the process runs — Windows allows renaming a
+    ;      locked image).
+    ;   4. Rename .tmp → ${BIN_VERSIONED} (target is now free).
+    ;   5. Best-effort delete .old (will fail if old process still holds it;
+    ;      that's fine — it'll be cleaned up on next install or reboot).
+    ; The ~0-ms window between steps 3 and 4 is covered by the launcher's
+    ; 5s watchdog loop: if it hits the gap, it logs + retries next cycle.
+    File /oname=${BIN_VERSIONED}.tmp "${BIN_SRC}"
+    Delete "$INSTDIR\${BIN_VERSIONED}.old"
+    ${If} ${FileExists} "$INSTDIR\${BIN_VERSIONED}"
+        Rename "$INSTDIR\${BIN_VERSIONED}" "$INSTDIR\${BIN_VERSIONED}.old"
+    ${EndIf}
+    Rename "$INSTDIR\${BIN_VERSIONED}.tmp" "$INSTDIR\${BIN_VERSIONED}"
+    Delete "$INSTDIR\${BIN_VERSIONED}.old"
 
     ; ---- OVER-SSH GUARD (§12, H3b) — upgrade only ------------------------ ;
     ; Only the UPGRADE path stops a live old stack (stop-old-stack), so only it
@@ -349,18 +378,23 @@ Section "Koidra Gateway (required)" SecCore
 
     ; Seed the AUTHORITATIVE version pointer with the versioned binary name (never
     ; a bare unversioned name). The launcher reads this first; the in-process
-    ; updater rewrites it (temp+rename).
-    FileOpen $0 "$INSTDIR\current-koidra-gateway.txt" w
+    ; updater rewrites it (temp+rename). Write temp+rename here too so the
+    ; launcher never sees a truncated pointer during the ~0-ms write window.
+    FileOpen $0 "$INSTDIR\current-koidra-gateway.txt.tmp" w
     FileWrite $0 "${BIN_VERSIONED}"
     FileClose $0
+    Delete "$INSTDIR\current-koidra-gateway.txt"
+    Rename "$INSTDIR\current-koidra-gateway.txt.tmp" "$INSTDIR\current-koidra-gateway.txt"
 
     ; M2: bake the DEFAULT pointer from GW_SHA (the sha this installer actually
     ; bundled). The updater NEVER rewrites this file, so it survives an emptied /
     ; half-written current pointer and keeps the launcher off the hardcoded literal
     ; fallback — the fallback is now a true last resort (both pointers missing).
-    FileOpen $0 "$INSTDIR\default-koidra-gateway.txt" w
+    FileOpen $0 "$INSTDIR\default-koidra-gateway.txt.tmp" w
     FileWrite $0 "${BIN_VERSIONED}"
     FileClose $0
+    Delete "$INSTDIR\default-koidra-gateway.txt"
+    Rename "$INSTDIR\default-koidra-gateway.txt.tmp" "$INSTDIR\default-koidra-gateway.txt"
 
     ; Record the old dir so the rollback launchers (start-*-old.vbs) can find it.
     FileOpen $0 "$INSTDIR\old-install-dir.txt" w

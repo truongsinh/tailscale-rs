@@ -22,7 +22,7 @@ Environment=KOIDRA_TARGET=x86_64-unknown-linux-musl
 # this (checked in src/lib.rs init). run.sh also exports it (belt-and-braces).
 Environment=TS_RS_EXPERIMENT=this_is_unstable_software
 WorkingDirectory=/home/sinh/koidra-gateway
-ExecStart=/home/sinh/koidra-gateway/run.sh primary 2222
+ExecStart=/home/sinh/koidra-gateway/run.sh primary 22
 
 # Restart on unexpected exit, but give up after 2 failures in 60s so a wedged
 # binary can't spin forever (rollback is the coordinator's job, not an auto-revert).
@@ -30,6 +30,12 @@ Restart=on-failure
 RestartSec=5
 StartLimitBurst=2
 StartLimitIntervalSec=60
+
+# Required for russh's crypto vector allocation (mlock). Without this the
+# process silently dies after ~7 hours of runtime when the crypto path tries
+# to lock memory pages for key material and hits the default RLIMIT_MEMLOCK
+# ceiling (typically 64 KiB — far too small for a long-lived SSH server).
+LimitMEMLOCK=infinity
 
 # Hardening. ProtectHome is intentionally NOT set: the install dir is under /home,
 # and ProtectHome=yes would hide the unit's own run.sh / binary / node-*.json →
