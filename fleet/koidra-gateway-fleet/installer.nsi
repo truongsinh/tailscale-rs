@@ -694,7 +694,7 @@ Section "Start koidra-gateway channels" SecStart
             ; the new processes to crash silently.
             FileOpen $R8 "$INSTDIR\kill-old-gw.cmd" w
             FileWrite $R8 '@echo off$\r$\n'
-            FileWrite $R8 'for /f "tokens=2" %%p in ('tasklist /nh /fo csv ^| findstr /i "koidra-gateway"') do taskkill /f /pid %%p 2>nul$\r$\n'
+            FileWrite $R8 'taskkill /f /im koidra-gateway-*.exe 2>nul$\r$\n'
             FileClose $R8
             nsExec::ExecToLog '"$INSTDIR\kill-old-gw.cmd"'
             Delete "$INSTDIR\kill-old-gw.cmd"
