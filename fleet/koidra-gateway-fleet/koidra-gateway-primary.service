@@ -24,9 +24,13 @@ Environment=TS_RS_EXPERIMENT=this_is_unstable_software
 WorkingDirectory=/home/sinh/koidra-gateway
 ExecStart=/home/sinh/koidra-gateway/run.sh primary 22
 
-# Restart on unexpected exit, but give up after 2 failures in 60s so a wedged
-# binary can't spin forever (rollback is the coordinator's job, not an auto-revert).
-Restart=on-failure
+# Restart=always: the in-process updater calls process::exit(0) after committing
+# a binary swap (current-koidra-gateway.txt → new version). Restart=on-failure
+# treats exit(0) as success and does NOT restart → service stays dead → SSH wedge
+# (verified 2026-07-21 via local systemd repro: on-failure+exit0 = inactive/dead,
+# always+exit0 = auto-restart). `systemctl stop` still wins — systemd does not
+# honor Restart= on a clean stop. StartLimitBurst guards against tight-spinning.
+Restart=always
 RestartSec=5
 StartLimitBurst=2
 StartLimitIntervalSec=60
