@@ -86,9 +86,13 @@ Name "Koidra Gateway"
 OutFile "koidra-gateway-setup.exe"
 Unicode True
 ShowInstDetails show
-; The installer is launched at console by the operator. It self-detects the
-; existing layout; it does NOT auto-elevate (Win7 non-admin boxes can't).
-RequestExecutionLevel user
+; Auto-elevate via UAC application manifest. This ensures the installer ALWAYS
+; runs with admin privileges → scheduled tasks are ALWAYS created (SYSTEM, onstart,
+; persistent). Without this, a non-elevated double-click falls to the non-admin
+; path (Startup shortcut, no tasks, non-persistent) — the root cause of bioverbeek
+; and redsun-win10 ending up with no tasks after install. On non-admin boxes the
+; operator must run from an elevated cmd prompt (runas /user:Administrator).
+RequestExecutionLevel admin
 
 ; The staged versioned binary name. Overridable at build time (-DGW_SHA=<sha>).
 ; This name IS the process image AND the pointer-file content AND what the
