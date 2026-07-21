@@ -69,18 +69,23 @@ if "%PORT%"=="" set "PORT=22"
 
 rem ---- resolve the binary -------------------------------------------------- rem
 rem Order: hardcoded literal (last resort) < installer-baked default pointer <
-rem authoritative current pointer < explicit override arg. Delayed expansion
-rem (!VAR!) is REQUIRED inside the parenthesized blocks: %VAR% would expand at
-rem PARSE time (before set /p runs) and the pointer would be silently ignored.
+rem authoritative current pointer < explicit override arg.
+rem
+rem ENCODING FIX: use `for /f ... in ('type ...')` instead of `set /p` to read
+rem pointer files. The `type` command converts UTF-16LE/BOM to ANSI on Windows;
+rem `set /p` reads raw bytes → a UTF-16 BOM (FF FE) becomes part of the filename
+rem → the resolved exe path is garbage → the gateway never launches. This was the
+rem root cause of the redsun-win10/ayo start-step failure: the operator's
+rem PowerShell `>` redirection wrote the pointer in UTF-16LE.
 set "EXE=%DIR%\koidra-gateway-06f9a3a.exe"
 
 if exist "%DIR%\default-koidra-gateway.txt" (
-    set /p DEF=<"%DIR%\default-koidra-gateway.txt"
+    for /f "usebackq delims=" %%D in (`type "%DIR%\default-koidra-gateway.txt" 2^>nul`) do set "DEF=%%D"
     if not "!DEF!"=="" set "EXE=%DIR%\!DEF!"
 )
 
 if exist "%DIR%\current-koidra-gateway.txt" (
-    set /p TARGET=<"%DIR%\current-koidra-gateway.txt"
+    for /f "usebackq delims=" %%T in (`type "%DIR%\current-koidra-gateway.txt" 2^>nul`) do set "TARGET=%%T"
     if not "!TARGET!"=="" set "EXE=%DIR%\!TARGET!"
 )
 
@@ -98,7 +103,7 @@ rem ======================== SUPERVISE LOOP ================================= re
     rem diagnoses + backs off (so a key staged later self-heals) and NEVER dips
     rem into the crash-loop. Handles missing, empty, and whitespace-only files.
     set "AUTHKEY="
-    if exist "%DIR%\authkey.txt" set /p AUTHKEY=<"%DIR%\authkey.txt"
+    if exist "%DIR%\authkey.txt" for /f "usebackq delims=" %%A in (`type "%DIR%\authkey.txt" 2^>nul`) do set "AUTHKEY=%%A"
     set "AKCHK=!AUTHKEY: =!"
     if not defined AKCHK (
         >>"%DIR%\koidra-diag.txt" echo [!DATE! !TIME!] run-node2.cmd %CHAN%: authkey.txt missing/empty/whitespace - NOT launching [would crash on bare -k]; backing off %MAX_DELAY%s
