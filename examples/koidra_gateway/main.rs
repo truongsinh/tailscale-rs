@@ -162,15 +162,20 @@ impl Handler for ShellServer {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
         tracing::debug!(channel = %channel.id(), remote = %self.remote, "new session");
         // Per-channel driver task. Owns the child + all copy pumps. Drains the
         // inbound mpsc via `channel.wait()` so russh's dispatch loop never blocks
-        // on `chan.send(Data)` (see struct doc).
+        // on `chan.send(Data)` (see struct doc). The session handle lets the loop
+        // answer want_reply exec/shell requests (channel_success / channel_failure
+        // per RFC 4254 §6.5) — without it, clients that gate their data on the
+        // confirmation (openssh, russh's exec(true, ..), PowerShell remoting
+        // clients) hang until their idle timer fires and tears down the connection.
         let remote = self.remote;
+        let handle = session.handle();
         tokio::spawn(async move {
-            run_session(channel, remote).await;
+            run_session(channel, handle, remote).await;
         });
         Ok(true)
     }
@@ -208,21 +213,45 @@ fn platform_exec_flag() -> &'static str {
 /// Per-channel session driver: spawn child on first exec/shell request, then
 /// concurrently copy inbound data → child stdin and child stdout/stderr → client
 /// until child exits or client closes.
-async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
+///
+/// `handle` is the per-session russh Handle (`Session::handle()`), used to answer
+/// `want_reply` exec/shell requests with channel_success / channel_failure
+/// (RFC 4254 §6.5). Without this reply, confirmation-gated clients
+/// (openssh, russh `exec(true, ..)`, PowerShell remoting) hang waiting for it
+/// until their idle timer drops the connection — symptomatically
+/// indistinguishable from a "dropped connection", and the actual cause of the
+/// large-EncodedCommand disconnects (a base64 payload of more than a few hundred
+/// bytes pushes the client past its want-reply idle window before the child
+/// starts consuming stdin).
+async fn run_session(
+    mut channel: Channel<Msg>,
+    handle: russh::server::Handle,
+    remote: std::net::SocketAddr,
+) {
     // Wait for an exec or shell request before spawning the child.
     let mut pending_command: Option<String> = None;
     let mut want_shell = false;
+    // No dead initializer: every path that leaves the loop via `break` assigns
+    // it, and every other path returns.
+    let want_reply;
     loop {
         let Some(msg) = channel.wait().await else {
             return;
         };
         match msg {
-            ChannelMsg::Exec { command, .. } => {
+            ChannelMsg::Exec {
+                command,
+                want_reply: reply_requested,
+            } => {
                 pending_command = Some(String::from_utf8_lossy(&command).into_owned());
+                want_reply = reply_requested;
                 break;
             }
-            ChannelMsg::RequestShell { .. } => {
+            ChannelMsg::RequestShell {
+                want_reply: reply_requested,
+            } => {
                 want_shell = true;
+                want_reply = reply_requested;
                 break;
             }
             ChannelMsg::Eof | ChannelMsg::Close => return,
@@ -284,12 +313,36 @@ async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, channel = %channel.id(), program = shell, "spawning process");
+            // RFC 4254 §6.5: a want_reply request MUST be answered. The
+            // request was not honored (spawn failed), so reply channel_failure
+            // before tearing down. Without this, a confirmation-gated client
+            // waits indefinitely and its idle timer eventually drops the
+            // connection.
+            if want_reply {
+                let _ = handle.channel_failure(channel.id()).await;
+            }
             drop(channel.exit_status(127).await);
             drop(channel.eof().await);
             drop(channel.close().await);
             return;
         }
     };
+
+    // RFC 4254 §6.5: answer a want_reply exec/shell request with
+    // channel_success once the request is accepted (child spawned). Clients
+    // that gate their I/O on the confirmation (openssh, russh exec(true, ..),
+    // PowerShell remoting) hang forever — or until their idle timer drops the
+    // connection — without this reply. Sent before the stdout/stderr pumps
+    // start so the confirmation precedes any data. This is the root fix for
+    // the ">2KB EncodedCommand drops the connection" symptom: a large
+    // PowerShell base64 payload delays the child's first stdout byte past the
+    // client's want-reply idle window, after which the client concludes the
+    // server is dead and disconnects. Replying channel_success the instant the
+    // child is spawned — independent of when it produces output — closes that
+    // window for any payload size.
+    if want_reply {
+        let _ = handle.channel_success(channel.id()).await;
+    }
 
     tracing::info!(
         channel = %channel.id(),
@@ -332,22 +385,54 @@ async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
         // stdin drops here → child sees EOF on stdin
     });
 
+    // Drive the session until ANY of:
+    //   - the client sends Eof / Close (client-initiated teardown),
+    //   - the child process exits (we must report its status and close),
+    //   - the channel mpsc is exhausted (channel.wait() returns None).
+    //
+    // Pre-fix this loop only watched channel.wait() for teardown signals. When
+    // the child exited before the client signalled Eof (the common case for
+    // any non-trivial command and every interactive shell where the user
+    // hasn't closed stdin), the server stayed stuck in channel.wait(), the
+    // client stayed blocked waiting for SSH_MSG_CHANNEL_EOF / exit-status, and
+    // the session wedged until the TCP connection timed out — which presents
+    // externally as a dropped connection. This is the secondary cause of the
+    // large-EncodedCommand disconnects: a want_reply exec that never reaches
+    // child-exit-driven teardown leaves the client hanging on a confirmation
+    // that already arrived, then on data that's already been produced, and
+    // eventually on a teardown that never comes.
+    //
+    // tokio::process::Child::wait is cancel-safe per its docs and idempotent
+    // after completion (subsequent calls return the cached ExitStatus), so it
+    // is safe to poll it inside select! on every loop iteration.
     let mut exit_seen: Option<u32> = None;
+    let mut child_exit_code: Option<u32> = None;
     loop {
-        let Some(msg) = channel.wait().await else { break };
-        match msg {
-            ChannelMsg::Data { data }
-                if stdin_tx.send(data.to_vec()).is_err() =>
-            {
+        tokio::select! {
+            msg = channel.wait() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    ChannelMsg::Data { data }
+                        if stdin_tx.send(data.to_vec()).is_err() =>
+                    {
+                        break;
+                    }
+                    ChannelMsg::Data { .. } => {}
+                    ChannelMsg::Eof => break,
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        exit_seen = Some(exit_status);
+                    }
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            status = child.wait() => {
+                child_exit_code = Some(match status {
+                    Ok(s) => s.code().unwrap_or(128) as u32,
+                    Err(_) => 128,
+                });
                 break;
             }
-            ChannelMsg::Data { .. } => {}
-            ChannelMsg::Eof => break,
-            ChannelMsg::ExitStatus { exit_status } => {
-                exit_seen = Some(exit_status);
-            }
-            ChannelMsg::Close => break,
-            _ => {}
         }
     }
     drop(stdin_tx);
@@ -355,11 +440,16 @@ async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
     drop(stdout_task.await);
     drop(stderr_task.await);
 
-    let status = child.wait().await;
-    let code = match (exit_seen, status) {
-        (Some(c), _) => c,
-        (None, Ok(s)) => s.code().unwrap_or(128) as u32,
-        (None, Err(_)) => 128,
+    // If the client-side path broke the loop before the child exited, we still
+    // need to wait so we report a real status. If the child.wait() branch fired,
+    // child_exit_code is set and we skip the second wait.
+    let code = if let Some(c) = child_exit_code.or(exit_seen) {
+        c
+    } else {
+        match child.wait().await {
+            Ok(s) => s.code().unwrap_or(128) as u32,
+            Err(_) => 128,
+        }
     };
     tracing::info!(channel = %channel_id, exit_status = code, "session finished");
     drop(channel.exit_status(code).await);
@@ -443,6 +533,18 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
             keys: vec![host_key],
             methods: russh::MethodSet::from(&[russh::MethodKind::None][..]),
             nodelay: true,
+            // Advertise a 1 MiB maximum packet size so large exec-request
+            // payloads (notably PowerShell `-EncodedCommand` with multi-KB
+            // base64 scripts) fit inside a single SSH CHANNEL_REQUEST packet
+            // from the client. russh's default is 32 KiB, which is enough for
+            // ordinary shell commands but not for "run this base64-encoded
+            // script" payloads — once the client's CHANNEL_REQUEST exceeds the
+            // advertised maximum, some SSH implementations drop the connection
+            // rather than fragment. 1 MiB comfortably covers any realistic
+            // exec payload while staying well under russh's 256 KiB transport
+            // hard cap (russh logs a warning above 64 KiB but still honors the
+            // value).
+            maximum_packet_size: 1024 * 1024,
             ..Default::default()
         },
         (ipv4, args.listen_port).into(),

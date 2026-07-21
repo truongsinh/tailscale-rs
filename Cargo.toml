@@ -277,6 +277,10 @@ name = "exec_stdin_integrity"
 required-features = ["ssh"]
 
 [[test]]
+name = "exec_channel_edge_cases"
+required-features = ["ssh"]
+
+[[test]]
 name = "stress_ssh_churn"
 required-features = ["ssh"]
 
