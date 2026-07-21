@@ -244,7 +244,34 @@ async fn run_session(mut channel: Channel<Msg>, remote: std::net::SocketAddr) {
         cmd.arg(flag);
     }
     if !cmd_str.is_empty() {
-        cmd.arg(&cmd_str);
+        // The command string arrives verbatim from the SSH exec request and must
+        // reach the shell (cmd.exe /C ... on Windows, /bin/sh -c ... on Unix)
+        // EXACTLY as the client sent it. Rust's default `Command::arg` on Windows
+        // applies MSVCRT-style escaping (wrap in quotes if there's whitespace,
+        // backslash-escape internal quotes, double preceding backslashes before
+        // quotes). cmd.exe then applies its OWN quote-stripping rules on top,
+        // which corrupts the command:
+        //
+        //   * `echo "hello world"` arrives at cmd as `echo \"hello world\"`
+        //     → cmd strips outer quotes → `echo \"hello world\"` → cmd splits on
+        //     spaces → result loses the quotes AND sprouts backslashes.
+        //   * `dir "C:\Program Files\"` arrives with the trailing backslash
+        //     doubled and the closing quote escaped → cmd never sees a closing
+        //     quote and the rest of the command is misparsed.
+        //
+        // `raw_arg` writes the argument into the Windows command line with NO
+        // escaping, so cmd.exe sees the exec bytes byte-for-byte. Unix `/bin/sh
+        // -c <cmd>` does its own quote processing as part of shell syntax, so
+        // the default escaping there is correct (no special handling needed).
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.raw_arg(&cmd_str);
+        }
+        #[cfg(not(windows))]
+        {
+            cmd.arg(&cmd_str);
+        }
     }
 
     let child = cmd
