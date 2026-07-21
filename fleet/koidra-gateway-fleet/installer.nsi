@@ -643,6 +643,16 @@ Section "Start koidra-gateway channels" SecStart
         nsExec::ExecToLog 'schtasks /create /tn "KoidraGateway-backup" /ru SYSTEM /sc onstart /rl HIGHEST /tr "cmd /c $INSTDIR\run-node2.cmd backup 22" /f'
         Pop $0
 
+        ; Remove any non-admin Startup .lnk (it competes with the SYSTEM tasks —
+        ; both would launch gateway processes, causing identity/port conflicts).
+        ; Covers both all-users and current-user Startup folders.
+        SetShellVarContext all
+        Delete "$SMSTARTUP\KoidraGateway.lnk"
+        Delete "$SMSTARTUP\KoidraSSH.lnk"
+        SetShellVarContext current
+        Delete "$SMSTARTUP\KoidraGateway.lnk"
+        Delete "$SMSTARTUP\KoidraSSH.lnk"
+
         ${If} $Mode == "upgrade"
             ; --- BACKUP channel: stop old backup, then start new backup --------
             DetailPrint "Upgrade: stopping OLD backup channel (primary still serving)..."
