@@ -480,11 +480,23 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     // Resolve the host-key path before we move anything out of `args` below.
     let host_key_path = args.host_key_path();
 
-    let dev = tailscale::Device::new(
-        &tailscale::Config::default_from_env_with_key_file(&args.key_file).await?,
-        args.auth_key,
-    )
-    .await?;
+    // Persistent host key: load if present, generate + write if absent. Both channels of
+    // a primary/backup pair point at the same path (default: next to `--key-file`) so the
+    // same physical box presents the same host identity regardless of which channel
+    // answered. See `tailscale::ssh::host_key` for the full design.
+    //
+    // Loaded BEFORE Device::new so its public half can be advertised to the coordination
+    // server in the very first MapRequest — that is what makes `tailscale ssh` against
+    // this gateway verify the host key automatically (no ProxyCommand, no manual
+    // known_hosts entry). Wire format and rationale documented on
+    // `tailscale::ssh::host_key_public_openssh_string` and `ts_control::Config::ssh_host_keys`.
+    let host_key = tailscale::ssh::load_or_generate_host_key(&host_key_path).await?;
+    let host_key_public = tailscale::ssh::host_key_public_openssh_string(&host_key)?;
+
+    let mut config = tailscale::Config::default_from_env_with_key_file(&args.key_file).await?;
+    config.ssh_host_keys = vec![host_key_public.clone()];
+
+    let dev = tailscale::Device::new(&config, args.auth_key).await?;
 
     let ipv4: IpAddr = dev.ipv4_addr().await?.into();
     let dev = Arc::new(dev);
@@ -521,12 +533,6 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
             }
         });
     }
-
-    // Persistent host key: load if present, generate + write if absent. Both channels of
-    // a primary/backup pair point at the same path (default: next to `--key-file`) so the
-    // same physical box presents the same host identity regardless of which channel
-    // answered. See `tailscale::ssh::host_key` for the full design.
-    let host_key = tailscale::ssh::load_or_generate_host_key(&host_key_path).await?;
 
     dev.serve_ssh::<ShellServer>(
         russh::server::Config {

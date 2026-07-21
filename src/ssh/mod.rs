@@ -38,7 +38,10 @@ pub mod host_key;
 mod ratatui;
 
 pub use channel_server::{ChannelEvent, ChannelHandler, ChannelServer};
-pub use host_key::{HostKeyError, load_or_generate as load_or_generate_host_key};
+pub use host_key::{
+    HostKeyError, load_or_generate as load_or_generate_host_key,
+    public_openssh_string as host_key_public_openssh_string,
+};
 pub use ratatui::{RatatuiApp, RatatuiEnv, RatatuiTerm};
 
 /// How long a connection has to complete the SSH handshake before it is dropped.

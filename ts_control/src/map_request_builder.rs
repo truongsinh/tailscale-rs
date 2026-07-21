@@ -46,14 +46,17 @@ fn ipn_version() -> &'static str {
 }
 
 /// Populate the [`HostInfo`] fields that every outbound request shares: hostname, app name,
-/// composed `ipn_version`, and the static platform fields (`os`, `machine`, `go_arch`).
+/// composed `ipn_version`, the static platform fields (`os`, `machine`, `go_arch`), and the
+/// advertised SSH host keys.
 ///
 /// This is the single seam through which all HostInfo is populated — registration, the
 /// streaming map request, and DERP rehome requests all route through it so the identity
 /// reported to control is identical and survives reconnect/rehome.
 ///
 /// `client_name` is borrowed for `'a`, so callers bind it (from [`Config::format_client_name`])
-/// to a local that outlives the request.
+/// to a local that outlives the request. The same is true for the SSH host keys: they are
+/// borrowed from `config.ssh_host_keys` for the lifetime of the request, so the caller must
+/// keep `config` alive past the `MapRequest` send.
 pub(crate) fn apply_host_info<'a>(
     host_info: &mut HostInfo<'a>,
     config: &'a Config,
@@ -67,6 +70,14 @@ pub(crate) fn apply_host_info<'a>(
     host_info.os = std::env::consts::OS;
     host_info.machine = std::env::consts::ARCH;
     host_info.go_arch = go_arch(std::env::consts::ARCH);
+
+    // Advertise SSH host keys so `tailscale ssh` clients populate known_hosts from the
+    // coordination server's MapResponse without falling back to a ProxyCommand. Empty by
+    // default — only the koidra-gateway (which runs an in-process russh server) populates
+    // this; other crates built on ts_control stay silent.
+    if !config.ssh_host_keys.is_empty() {
+        host_info.ssh_host_keys = Some(config.ssh_host_keys.iter().map(String::as_str).collect());
+    }
 }
 
 /// Builder type for [`MapRequest`]s; smooths over the annoying parts of creating a request.
@@ -163,7 +174,9 @@ impl<'a> MapRequestBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{go_arch, ipn_version};
+    use super::{go_arch, ipn_version, apply_host_info};
+    use crate::Config;
+    use ts_control_serde::HostInfo;
 
     #[test]
     fn go_arch_maps_known_targets_and_passes_through_unknown() {
@@ -208,5 +221,56 @@ mod tests {
     fn ipn_version_is_cached() {
         // The OnceLock hands back the same allocation on every call.
         assert!(std::ptr::eq(ipn_version().as_ptr(), ipn_version().as_ptr()));
+    }
+
+    /// `apply_host_info` populates `HostInfo::ssh_host_keys` from `Config::ssh_host_keys`
+    /// in the exact wire format upstream Tailscale expects (no hostname prefix, no comment,
+    /// no trailing newline). This is the seam that lets `tailscale ssh` clients populate
+    /// known_hosts automatically without a `ProxyCommand`.
+    #[test]
+    fn apply_host_info_advertises_ssh_host_keys_when_set() {
+        let mut config = Config::default();
+        config.ssh_host_keys = vec![
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexamplebase64keydata".to_string(),
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY".to_string(),
+        ];
+
+        let mut hi = HostInfo::default();
+        apply_host_info(&mut hi, &config, "test-client");
+
+        let advertised = hi
+            .ssh_host_keys
+            .as_ref()
+            .expect("ssh_host_keys should be populated when config carries them");
+        assert_eq!(advertised.len(), 2, "both keys are advertised");
+        assert_eq!(advertised[0], config.ssh_host_keys[0]);
+        assert_eq!(advertised[1], config.ssh_host_keys[1]);
+
+        // Wire format invariants — these matter for client compat.
+        for key in advertised {
+            assert!(
+                !key.contains('\n') && !key.contains('\r'),
+                "advertised key must be a single line: {key:?}"
+            );
+            assert!(
+                !key.ends_with(' '),
+                "advertised key must not have a trailing space: {key:?}"
+            );
+        }
+    }
+
+    /// When the config carries no SSH host keys (the default for non-gateway callers),
+    /// `apply_host_info` leaves `ssh_host_keys` as `None`. That keeps `Hostinfo` minimal
+    /// and avoids advertising a Tailscale SSH server that isn't actually running.
+    #[test]
+    fn apply_host_info_omits_ssh_host_keys_when_empty() {
+        let config = Config::default();
+        let mut hi = HostInfo::default();
+        apply_host_info(&mut hi, &config, "test-client");
+        assert!(
+            hi.ssh_host_keys.is_none(),
+            "ssh_host_keys must be None when config has none, got {:?}",
+            hi.ssh_host_keys
+        );
     }
 }

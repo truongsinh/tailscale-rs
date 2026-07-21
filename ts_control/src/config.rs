@@ -23,6 +23,28 @@ pub struct Config {
 
     /// Tags to request from the control server.
     pub tags: Vec<String>,
+
+    /// SSH host public keys to advertise to the coordination server.
+    ///
+    /// Each entry must be a single-line OpenSSH authorized-keys value of the form
+    /// `<key-type> <base64-blob>` (e.g. `"ssh-ed25519 AAAA..."`), with no trailing
+    /// comment, hostname prefix, or newline. This is the same format upstream
+    /// Tailscale populates `Hostinfo.SSH_HostKeys` with (see
+    /// `ssh/tailssh/hostkeys.go::getHostKeyPublicStrings` in tailscale/tailscale).
+    ///
+    /// When non-empty, the keys are attached to every outbound `Hostinfo` — both
+    /// the initial registration and subsequent streaming `MapRequest`s — so peers
+    /// running `tailscale ssh` against this node can populate their `known_hosts`
+    /// automatically and verify the host key without a manual
+    /// `ProxyCommand="tailscale nc %h %p"` fallback.
+    ///
+    /// The coordination-server transport (Noise) is itself authenticated by the
+    /// node key, so the advertised SSH host keys are transitively signed by the
+    /// node identity — clients trust them because they trust the node key, not
+    /// because of a separate `NodeKeySignature` payload. That matches upstream's
+    /// model: `SSH_HostKeys` is a hint about which SSH public keys the node will
+    /// present, not a separately-signed claim.
+    pub ssh_host_keys: Vec<String>,
 }
 
 impl Config {
@@ -62,6 +84,7 @@ impl Default for Config {
             hostname: gethostname::gethostname().into_string().ok(),
             client_name: None,
             tags: Default::default(),
+            ssh_host_keys: Default::default(),
         }
     }
 }
