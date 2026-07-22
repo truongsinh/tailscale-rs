@@ -131,10 +131,29 @@ rem ======================== SUPERVISE LOOP ================================= re
     for /f "tokens=1-3 delims=:.," %%a in ("!T!") do set /a "START=(((100%%a %% 100)*60)+(100%%b %% 100))*60+(100%%c %% 100)"
 
     rem ---- launch (foreground; the loop relaunches on exit) --------------- rem
+    rem
+    rem stderr capture: ffa06a8's launcher ran the gateway with stderr
+    inheriting the cmd.exe's NUL handle (the scheduled task has no console),
+    so a Rust panic abort (the kind that produces `STATUS_FATAL_APP_EXIT`
+    in the Application log with no Rust-side context) left zero diagnostic
+    evidence. The redsun wedge (2026-07-21, ~5h of runtime then control-
+    plane death with no panic in the Application log) was un-diagnosable
+    because of this. Capturing stderr to a per-channel log file makes the
+    NEXT wedge leave a trace — the panic message, the aborting thread's
+    backtrace (when RUST_BACKTRACE=full is set below), or the tracing
+    framework's final error line.
+    rem
+    rem Each launch TRUNCATES the log (single `>`); the prior run's log is
+    lost, but the file can't grow unbounded across a crashloop. The
+    koidra-diag.txt above keeps the cross-launch timeline.
+    set "RUST_BACKTRACE=full"
+    set "RUST_LIB_BACKTRACE=1"
+    set "LOGFILE=%DIR%\koidra-gateway-%CHAN%.stderr.log"
+    >>"%DIR%\koidra-diag.txt" echo [!DATE! !TIME!] run-node2.cmd %CHAN%: launching !EXE! (stderr to %LOGFILE%)
     if defined KOIDRA_MANIFEST_URL (
-        "!EXE!" -c "%DIR%\%CHAN%.json" -k !AUTHKEY! --listen-port %PORT% --install-dir "%DIR%" --manifest-url "%KOIDRA_MANIFEST_URL%"
+        "!EXE!" -c "%DIR%\%CHAN%.json" -k !AUTHKEY! --listen-port %PORT% --install-dir "%DIR%" --manifest-url "%KOIDRA_MANIFEST_URL%" >"%LOGFILE%" 2>&1
     ) else (
-        "!EXE!" -c "%DIR%\%CHAN%.json" -k !AUTHKEY! --listen-port %PORT% --install-dir "%DIR%"
+        "!EXE!" -c "%DIR%\%CHAN%.json" -k !AUTHKEY! --listen-port %PORT% --install-dir "%DIR%" >"%LOGFILE%" 2>&1
     )
 
     rem ---- elapsed + fast-exit backoff ----------------------------------- rem
