@@ -69,7 +69,10 @@ pub struct Client<Io> {
 pub async fn connect<'c>(
     region: impl IntoIterator<Item = &'c ServerConnInfo>,
 ) -> Result<Option<DefaultIo>, Error> {
-    let Some((conn, _, addr)) = crate::dial::dial_region_tls(region).await.unwrap() else {
+    // Propagate dial errors (TLS construction failures) instead of panicking.
+    // Ok(None) — all servers unreachable — is still passed through to the caller,
+    // which converts it to Error::AllServersUnreachable at the Client::connect layer.
+    let Some((conn, _, addr)) = crate::dial::dial_region_tls(region).await? else {
         return Ok(None);
     };
 
@@ -289,7 +292,14 @@ impl Client<DefaultIo> {
         region: impl IntoIterator<Item = &'c ServerConnInfo>,
         node_keypair: &NodeKeyPair,
     ) -> Result<Self, Error> {
-        let conn = connect(region).await?.unwrap();
+        // connect() returns Ok(None) under total outage (all servers unreachable).
+        // The prior `.unwrap()` panicked in that case, taking down the Uniderp task
+        // and cascading through the dataplane. Propagate as a typed error instead —
+        // the caller (Runner::connect in ts_runtime) already handles Err by backing
+        // off and retrying.
+        let conn = connect(region)
+            .await?
+            .ok_or(Error::AllServersUnreachable)?;
 
         Client::handshake(conn, node_keypair).await
     }

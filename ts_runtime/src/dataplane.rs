@@ -164,7 +164,12 @@ impl Message<StreamMessage<DiscoInternal, (), ()>> for DataplaneActor {
 
         tracing::trace!(?pkt, "decrypted disco message");
 
-        self.env.publish_noretain(pkt).await.unwrap();
+        // Publish failures (bus shutting down, registry closed) are not fatal to
+        // the dataplane — the disco packet is simply dropped. The prior `.unwrap()`
+        // cascaded bus shutdowns into a dataplane panic.
+        if let Err(e) = self.env.publish_noretain(pkt).await {
+            tracing::warn!(error = %e, "publishing decrypted disco message");
+        }
     }
 }
 
@@ -181,10 +186,13 @@ impl Message<StreamMessage<StunInternal, (), ()>> for DataplaneActor {
             _ => return,
         };
 
-        self.env
+        if let Err(e) = self
+            .env
             .publish_noretain(IncomingStunMsg(pkt.freeze()))
             .await
-            .unwrap();
+        {
+            tracing::warn!(error = %e, "publishing stun message");
+        }
     }
 }
 

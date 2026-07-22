@@ -312,7 +312,18 @@ async fn write_to_overlay(slf: &CoreState, packets: HashMap<OverlayTransportId, 
     for (id, packets) in packets {
         if let Some(queue) = slf.overlay_transports.get(&id) {
             tracing::trace!(overlay_id = ?id, n_packets = packets.len());
-            queue.send(packets).unwrap();
+            // The overlay transport's queue may have closed if the consumer task
+            // (e.g. an overlay listener) exited. This is expected during partial
+            // shutdown (one transport gone while others remain) and must not panic
+            // the dataplane. Drop the packet batch and continue with the remaining
+            // overlays.
+            if let Err(send_err) = queue.send(packets) {
+                tracing::warn!(
+                    overlay_id = ?id,
+                    error = ?send_err,
+                    "overlay transport queue closed; dropping packet batch",
+                );
+            }
         }
     }
 }
@@ -325,7 +336,22 @@ async fn write_to_underlay(
         tracing::trace!(underlay_id = ?tid, %peer_id, n_packets = packets.len());
 
         if let Some(queue) = slf.underlay_transports.get(&tid) {
-            queue.send((peer_id, packets)).unwrap();
+            // The underlay transport's queue closes when the Uniderp task exits —
+            // either because the Runner task panicked (the connect-unwrap
+            // regression fixed in ts_derp::Client::connect) or because of normal
+            // region teardown. The prior `.unwrap()` panicked here, cascading the
+            // Uniderp death into the DataplaneActor and permanently bricking SSH.
+            // Drop the batch and let the dataplane continue serving the remaining
+            // underlays; the supervisor restarts the dead Uniderp.
+            if let Err(send_err) = queue.send((peer_id, packets)) {
+                tracing::warn!(
+                    underlay_id = ?tid,
+                    %peer_id,
+                    error = ?send_err,
+                    "underlay transport queue closed; dropping packet batch \
+                     (upstream Uniderp task likely exited)",
+                );
+            }
         }
     }
 }

@@ -28,6 +28,15 @@ pub enum Error {
     /// Error in HTTP connection.
     #[error("http error")]
     Http,
+
+    /// All DERP servers in the region were unreachable. Returned instead of
+    /// panicking when `dial_region_tls` yields no viable candidate.
+    #[error("all DERP servers in the region were unreachable")]
+    AllServersUnreachable,
+
+    /// Error during dialing (TLS construction on a reachable server).
+    #[error(transparent)]
+    Dial(#[from] crate::dial::Error),
 }
 
 impl From<ts_http_util::Error> for Error {
