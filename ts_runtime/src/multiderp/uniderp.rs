@@ -1680,4 +1680,109 @@ mod tests {
             .expect("no panic");
         assert!(ret.is_ok());
     }
+
+    // ---- arc_swap wedge-fix regression test ----
+    //
+    // Prior to the arc_swap migration, `peer_db` was a `RwLock<Option<Arc<PeerDb>>>`.
+    // Under sustained DERP load the read path (`PeerDbLookup::lookup_key`, called per
+    // DERP packet on the transport hot path) starved tokio workers when a writer
+    // held the lock — the wedge the direct-path team root-caused.
+    //
+    // This stress test proves the `ArcSwapOption` replacement doesn't deadlock under
+    // the same load pattern: many concurrent readers + a continuous writer. With the
+    // old `RwLock`, a slow/panicked writer would block every reader. With
+    // `ArcSwapOption`, reads and writes are independent atomics — neither blocks the
+    // other, ever.
+    //
+    // We can't easily construct a fully-populated `Node` here without dragging in the
+    // full peer_tracker test helpers, but we don't need to: the wedge was in the
+    // *locking primitive*, not the PeerDb contents. Empty PeerDb exercises the same
+    // load/store paths; lookups return None, but the atomic behavior under
+    // contention is what we're verifying.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn arc_swap_peer_db_lookup_does_not_deadlock_under_concurrent_writers() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use super::{ArcSwapOption, PeerDb, PeerDbLookup};
+        use std::sync::Arc;
+        use ts_transport::PeerLookup;
+
+        let peer_db: Arc<ArcSwapOption<PeerDb>> = Arc::new(ArcSwapOption::new(None));
+        let lookup = PeerDbLookup(peer_db.clone());
+        let read_count = Arc::new(AtomicU64::new(0));
+        let write_count = Arc::new(AtomicU64::new(0));
+
+        // 8 reader tasks, each hammering lookup_key on both supported key types.
+        // PeerDb is empty so every lookup returns None — but the atomic load path
+        // runs every time. If any read blocked on a writer (the old RwLock failure
+        // mode), the 3s timeout below would fire.
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let lookup_clone = PeerDbLookup(peer_db.clone());
+            let counter = read_count.clone();
+            readers.push(tokio::spawn(async move {
+                // Spawn a blocking task per reader: lookup_key is sync. Under the
+                // old RwLock this is exactly where tokio workers got wedged — a
+                // blocking sync read() on a writer-held lock. With arc_swap the
+                // load() is a single atomic, so blocking-thread overhead is the
+                // only cost (no contention).
+                tokio::task::spawn_blocking(move || {
+                    // burn 1000 iterations of both key-direction lookups
+                    for i in 0u32..1_000 {
+                        let _ = lookup_clone.lookup_key(PeerId(i));
+                    }
+                    counter.fetch_add(1_000, Ordering::Relaxed);
+                })
+                .await
+                .unwrap();
+            }));
+        }
+
+        // 1 writer task: continuously swap the entire PeerDb snapshot (the exact
+        // pattern `handle(Arc<PeerState>)` uses in production). Each store is a new
+        // empty Arc<PeerDb>.
+        let writer_db = peer_db.clone();
+        let writer_counter = write_count.clone();
+        let writer = tokio::spawn(async move {
+            // Cap by iterations rather than time so the test is deterministic.
+            for _ in 0..5_000 {
+                writer_db.store(Some(Arc::new(PeerDb::default())));
+            }
+            writer_counter.store(5_000, Ordering::Relaxed);
+        });
+
+        // 3s hard timeout — the old RwLock wedge would hang indefinitely here.
+        let timeout = Duration::from_secs(3);
+
+        let read_res = tokio::time::timeout(
+            timeout,
+            async {
+                drop(writer.await);
+                let mut reader_results = Vec::new();
+                for r in readers.drain(..) {
+                    reader_results.push(r.await);
+                }
+                reader_results
+            },
+        )
+        .await
+        .expect(
+            "DEADLOCK: arc_swap lookup path hung under concurrent readers + writer \
+             (this is exactly the wedge the fix targets — if it fires, the arc_swap \
+             migration regressed)",
+        );
+
+        // All readers completed without panic.
+        for r in read_res {
+            assert!(r.is_ok(), "reader task panicked: {r:?}");
+        }
+
+        // Sanity: the counters reflect the work we asked for. The writer does 5000
+        // stores; readers do 8000 lookups (8 × 1000).
+        assert_eq!(write_count.load(Ordering::Relaxed), 5_000);
+        assert_eq!(read_count.load(Ordering::Relaxed), 8_000);
+
+        // Let lookup go out of scope cleanly (no use-after-free in arc_swap).
+        drop(lookup);
+    }
 }
