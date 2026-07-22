@@ -537,48 +537,69 @@ impl Runner {
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id))]
     async fn run(&mut self) -> Result<(), ts_derp::Error> {
         let mut backoff = Self::RECONNECT_BASE_BACKOFF;
+        // Pre-connected transport from a previous make-before-break recycle.
+        // When Some, the outer loop uses it instead of calling connect(), so the
+        // data path never gaps during age-recycle. See run_transport's pre-connect
+        // spawn for how this gets populated.
+        let mut preconnected: Option<(DerpTransport, ts_derp::FrameActivity)> = None;
 
         loop {
             let pending = self.wait_for_activity().await;
 
-            // Reconnect with exponential backoff instead of letting a transient connect failure
-            // tear down the whole region task (which previously died until a derp map update
-            // respawned it). This keeps a region self-healing across brief derp outages.
-            //
-            // Time the connect so the data-path gap (the window in which no DERP frames can be
-            // delivered, including incoming SSH SYMs) is visible in logs. This is the gap the
-            // jitter on the recycle deadline above mitigates for the AGE-recycle trigger; other
-            // triggers (stall-recycle, watchdog-driven ForceRehome) go through the same path.
-            let connect_started = Instant::now();
-            let (transport, frames) = match self.connect(pending).await {
-                Ok(transport) => {
-                    let elapsed = connect_started.elapsed();
-                    if elapsed >= Duration::from_secs(1) {
+            // Use the pre-connected transport if available (make-before-break path),
+            // otherwise establish a fresh connection.
+            let (transport, frames) = if let Some(next) = preconnected.take() {
+                tracing::info!(
+                    region_id = %self.region_id,
+                    "using pre-connected transport from make-before-break recycle"
+                );
+                backoff = Self::RECONNECT_BASE_BACKOFF;
+                next
+            } else {
+                let connect_started = Instant::now();
+                match self.connect(pending).await {
+                    Ok(t) => {
+                        let elapsed = connect_started.elapsed();
+                        // Warn on >1s connects: the data path gaps for this duration.
+                        // With make-before-break, this branch only fires on INITIAL
+                        // connect or pre-connect FAILURE fallback — both are
+                        // non-recycle paths where a gap is unavoidable. If this warn
+                        // fires at the SAME timestamp as an SSH wedge, the gap is the
+                        // cause; if not, look elsewhere.
+                        if elapsed >= Duration::from_secs(1) {
+                            tracing::warn!(
+                                region_id = %self.region_id,
+                                ?elapsed,
+                                "derp connect took more than 1s (data-path gap)",
+                            );
+                        } else {
+                            tracing::debug!(
+                                region_id = %self.region_id,
+                                ?elapsed,
+                                "derp connection established"
+                            );
+                        }
+                        backoff = Self::RECONNECT_BASE_BACKOFF;
+                        t
+                    }
+                    Err(e) => {
                         tracing::warn!(
                             region_id = %self.region_id,
-                            ?elapsed,
-                            "derp connect took more than 1s — data-path was interrupted for this window",
+                            backoff = ?backoff,
+                            error = %e,
+                            "derp connect failed; backing off"
                         );
-                    } else {
-                        tracing::debug!(region_id = %self.region_id, ?elapsed, "derp connection established");
+                        tokio::time::sleep(backoff).await;
+                        backoff = next_backoff(backoff, Self::RECONNECT_MAX_BACKOFF);
+                        continue;
                     }
-                    backoff = Self::RECONNECT_BASE_BACKOFF;
-                    transport
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        region_id = %self.region_id,
-                        backoff = ?backoff,
-                        error = %e,
-                        "derp connect failed; backing off"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = next_backoff(backoff, Self::RECONNECT_MAX_BACKOFF);
-                    continue;
                 }
             };
 
-            self.run_transport(transport, frames).await?;
+            // run_transport returns Some(next_transport) when it exited via the
+            // make-before-break recycle path (pre-connected transport is ready),
+            // or None when it exited for another reason (stall, send timeout, etc.).
+            preconnected = self.run_transport(transport, frames).await?;
         }
     }
 
@@ -608,13 +629,7 @@ impl Runner {
     async fn connect(
         &self,
         pending: Option<(PeerId, Vec<PacketMut>)>,
-    ) -> Result<
-        (
-            impl UnderlayTransport<PeerKey = PeerId, Error = ts_derp::Error> + 'static,
-            ts_derp::FrameActivity,
-        ),
-        ts_derp::Error,
-    > {
+    ) -> Result<(DerpTransport, ts_derp::FrameActivity), ts_derp::Error> {
         tracing::trace!("establishing derp connection");
 
         let client = ts_derp::DefaultClient::connect(&self.region.servers, &self.keys).await?;
@@ -645,11 +660,14 @@ impl Runner {
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    async fn run_transport(
+    async fn run_transport<T>(
         &mut self,
-        transport: impl UnderlayTransport<PeerKey = PeerId, Error = ts_derp::Error>,
+        transport: T,
         frames: ts_derp::FrameActivity,
-    ) -> Result<(), ts_derp::Error> {
+    ) -> Result<Option<(DerpTransport, ts_derp::FrameActivity)>, ts_derp::Error>
+    where
+        T: UnderlayTransport<PeerKey = PeerId, Error = ts_derp::Error>,
+    {
         let connected_at = Instant::now();
         let mut last_activity = Instant::now();
         // rx-stall tracking is deliberately SEPARATE from `last_activity`: the mixed
@@ -668,26 +686,51 @@ impl Runner {
         let mut health_published = false;
         let mut from_dataplane = self.from_dataplane.lock().await;
 
+        // ---- Make-before-break age-recycle ----
+        //
+        // Instead of closing the old connection and THEN connecting (the old
+        // break-then-make path, which left a 1-5s data-path gap during which
+        // incoming SSH SYMs could not be delivered → "banner exchange" timeouts),
+        // we spawn a background task that establishes the NEW connection at the
+        // recycle deadline while the old transport continues serving traffic in
+        // this select! loop. When the new connection is ready, we swap: the old
+        // transport is dropped (on return), and the outer run() loop picks up the
+        // pre-connected transport immediately — zero data-path gap.
+        //
+        // If the pre-connect fails, we return None so the outer loop falls back to
+        // a fresh connect() (the legacy path). This is strictly better than the old
+        // behavior because the old transport was alive for the entire pre-connect
+        // window, not closed at the deadline.
+        //
+        // If run_transport exits for a DIFFERENT reason (rx-stall, send timeout,
+        // inactivity), the spawned pre-connect task keeps running in the background.
+        // It will establish a connection nobody reads; the result is dropped when
+        // the oneshot's Sender goes out of scope, and the Client's Drop closes the
+        // TLS/TCP socket. Wasteful but harmless — the outer loop's connect() wins
+        // the race for the next transport.
+        let recycle_deadline =
+            connected_at + jittered(Self::MAX_CONNECTION_AGE, jitter_seed(&self.keys.public));
+        let (preconnect_tx, preconnect_rx) =
+            tokio::sync::oneshot::channel::<Result<(DerpTransport, ts_derp::FrameActivity), ts_derp::Error>>();
+        {
+            let runner_clone = self.clone();
+            let deadline = recycle_deadline;
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline.into()).await;
+                tracing::debug!(
+                    "make-before-break: pre-connecting new derp connection at age-recycle deadline"
+                );
+                let result = runner_clone.connect(None).await;
+                drop(preconnect_tx.send(result));
+            });
+        }
+        let mut preconnect_rx = std::pin::pin!(preconnect_rx);
+
         loop {
             let span = tracing::trace_span!("derp_loop");
 
             let inactivity_timeout =
                 (!*self.home_derp_rx.borrow()).then(|| last_activity + Self::INACTIVITY_TIMEOUT);
-
-            // Recycle the connection once it is past the age floor. Returning `Ok` here drops the
-            // transport and sends `run` back around to reconnect, replacing a potentially wedged
-            // long-lived (home) socket with a fresh one.
-            //
-            // The deadline carries the same per-node jitter as `rx_stall_config` so primary +
-            // backup (different node keys) don't close their home DERP connections in lockstep.
-            // A synchronous recycle gap is brief (1-5s for TCP+TLS+Noise to the relay), but it's
-            // the data-path gap that surfaces as SSH "banner exchange" timeouts when a probe
-            // arrives during the reconnect window. Staggering the recycles eliminates the
-            // per-channel simultaneous failure; the gap itself is addressed by a future
-            // make-before-break recycle (which needs a boxed transport — UnderlayTransport is
-            // not object-safe today).
-            let recycle_deadline =
-                connected_at + jittered(Self::MAX_CONNECTION_AGE, jitter_seed(&self.keys.public));
 
             // Earliest instant an rx-stall could be declared; `None` while the predicate
             // cannot trip (not home / detection disabled). The deadline branch below
@@ -730,7 +773,7 @@ impl Runner {
 
                     let Some(from_net) = from_net else {
                         tracing::warn!(parent: &span, "transport queue closed");
-                        return Ok(());
+                        return Ok(None);
                     };
 
                     tracing::trace!(parent: &span, peer = %from_net.0, packets = from_net.1.len(), "packets to derp server");
@@ -747,7 +790,7 @@ impl Runner {
                                 timeout = ?self.send_timeout,
                                 "derp send timed out (write path wedged); recycling connection"
                             );
-                            return Ok(());
+                            return Ok(None);
                         }
                     }
                 },
@@ -755,17 +798,44 @@ impl Runner {
                 _ = option_timeout(inactivity_timeout) => {
                     if !*self.home_derp_rx.borrow_and_update() {
                         tracing::trace!(parent: &span, "timed out and not home derp, closing derp conn");
-                        return Ok(());
+                        return Ok(None);
                     }
                 },
 
-                _ = tokio::time::sleep_until(recycle_deadline.into()) => {
-                    tracing::debug!(
-                        parent: &span,
-                        region_id = %self.region_id,
-                        "recycling derp connection past age floor"
-                    );
-                    return Ok(());
+                // Make-before-break: the pre-connect task (spawned at the top of
+                // run_transport) fires at the recycle deadline and establishes a new
+                // DERP connection concurrently. When it completes, this branch fires,
+                // we return the new transport to the outer loop, and the old transport
+                // (the parameter of this call) is dropped — zero data-path gap.
+                result = &mut preconnect_rx => {
+                    match result {
+                        Ok(Ok((new_transport, new_frames))) => {
+                            tracing::info!(
+                                parent: &span,
+                                region_id = %self.region_id,
+                                connect_age = ?connected_at.elapsed(),
+                                "make-before-break: new derp connection ready, swapping (zero-gap)"
+                            );
+                            return Ok(Some((new_transport, new_frames)));
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                parent: &span,
+                                region_id = %self.region_id,
+                                error = %e,
+                                "make-before-break pre-connect failed; falling back to outer-loop reconnect"
+                            );
+                            return Ok(None);
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                parent: &span,
+                                region_id = %self.region_id,
+                                "pre-connect task dropped sender; falling back to outer-loop reconnect"
+                            );
+                            return Ok(None);
+                        }
+                    }
                 },
 
                 _ = option_timeout(rx_stall_deadline) => {
@@ -797,7 +867,7 @@ impl Runner {
 
                         // Local recovery: drop the one-way transport and let `run` reconnect
                         // — fresh TCP socket, fresh Noise handshake, fresh NAT/firewall state.
-                        return Ok(());
+                        return Ok(None);
                     }
 
                     let advanced = rx_stall.observe_frames(now, frames_now);
@@ -829,6 +899,14 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
 }
 
 struct PeerDbLookup(Arc<ArcSwapOption<PeerDb>>);
+
+/// The concrete DERP transport type returned by [`Runner::connect`].
+///
+/// Named so it can be carried across `run_transport` → outer-loop boundaries for
+/// make-before-break recycle (the pre-connected transport is established while the
+/// old one is still alive, then swapped in atomically — see [`Runner::run_transport`]).
+type DerpTransport =
+    ts_transport::MapPeerKey<ts_derp::DefaultClient, PeerDbLookup, PeerId>;
 
 impl ts_transport::PeerLookup<PeerId, NodePublicKey> for PeerDbLookup {
     fn lookup_key(&self, id: PeerId) -> Option<NodePublicKey> {
