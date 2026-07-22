@@ -539,7 +539,20 @@ impl Message<Arc<ts_control::StateUpdate>> for Uniderp {
         self.runner_state.region = region.clone();
 
         self.task.unlink(ctx.actor_ref()).await;
-        self.task.stop_gracefully().await.unwrap();
+        // Best-effort graceful stop: if the Task is already dead (e.g., the
+        // Runner panicked or returned between our last check and here), the
+        // stop_gracefully ask fails. That's fine — the Task is already
+        // stopped, which is what we wanted. The previous unwrap() would
+        // panic the Uniderp, cascading through on_stop unregister into the
+        // recovery paths.
+        if let Err(e) = self.task.stop_gracefully().await {
+            tracing::warn!(
+                region_id = %self.runner_state.region_id,
+                error = %e,
+                "stop_gracefully on region-change Task swap failed; \
+                 Task likely already stopped — proceeding with the fresh spawn"
+            );
+        }
         self.task
             .wait_for_shutdown_with_result(|e| {
                 if let Err(e) = e {

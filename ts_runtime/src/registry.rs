@@ -150,7 +150,27 @@ where
 
         let previous = self.actors.insert(msg.id, Box::new(msg.aref))?;
 
-        *previous.downcast().unwrap()
+        // Defensive downcast: in principle the stored entry under this Id
+        // (which includes TypeId::of::<A>()) was stored by a prior
+        // Register<A> with the same A, so the downcast should always match.
+        // But panicking here kills the Registry actor, which cascades to
+        // every Uniderp (ActorGone) and silences every recovery path that
+        // goes through the registry (which is all of them). Treat a
+        // mismatch as "no previous entry" + a loud warn so the symptom is
+        // visible without taking down the runtime's naming service.
+        match previous.downcast::<WeakActorRef<A>>() {
+            Ok(typed) => Some(*typed),
+            Err(stale) => {
+                tracing::warn!(
+                    actor_ty = %type_name::<A>(),
+                    "registry: Register downcast failed on previous entry; \
+                     treating as no previous entry (type mismatch should be \
+                     impossible — Id includes TypeId — but never panic here)"
+                );
+                drop(stale);
+                None
+            }
+        }
     }
 }
 
@@ -182,7 +202,26 @@ where
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Option<WeakActorRef<A>> {
         let previous = self.actors.remove(&msg.0)?;
-        *previous.downcast().unwrap()
+        // Defensive downcast: same reasoning as Register's handler. The Id
+        // (TypeId + name) is the key, so a prior insert under this Id should
+        // have stored a WeakActorRef<A>. But never panic here — a panic kills
+        // the Registry, cascading to every Uniderp via ActorGone and
+        // preventing every recovery path that uses the registry (all of them).
+        // Observed in canary: cadfddc Gate 2 died here because 0255ee7's
+        // on_stop unregister + this unwrap combined to kill the Registry on
+        // the first Runner-budget exhaustion.
+        match previous.downcast::<WeakActorRef<A>>() {
+            Ok(typed) => Some(*typed),
+            Err(stale) => {
+                tracing::warn!(
+                    actor_ty = %type_name::<A>(),
+                    "registry: Unregister downcast failed on removed entry; \
+                     treating as no previous entry"
+                );
+                drop(stale);
+                None
+            }
+        }
     }
 }
 
@@ -226,11 +265,23 @@ where
         let (deleg, sender) = ctx.reply_sender();
 
         if let Some(sender) = sender {
+            // Defensive downcast: never panic here — a panic in the Lookup
+            // handler would kill the Registry and cascade to every Uniderp
+            // + every Multiderp health check + every recovery tell. A
+            // mismatched entry is treated as "not found" and logged.
             let aref = self
                 .actors
                 .get(&msg.id)
-                .map(|x| x.downcast_ref::<WeakActorRef<A>>().unwrap())
+                .and_then(|x| x.downcast_ref::<WeakActorRef<A>>())
                 .cloned();
+
+            if self.actors.get(&msg.id).is_some() && aref.is_none() {
+                tracing::warn!(
+                    actor_ty = %type_name::<A>(),
+                    "registry: Lookup downcast failed on stored entry; \
+                     treating as not found"
+                );
+            }
 
             match (&aref, msg.wait) {
                 (Some(_), _) | (_, false) => {
@@ -384,7 +435,21 @@ where
             return RegistryForward::NotFound(msg.message);
         };
 
-        let Some(aref) = aref.downcast_ref::<WeakActorRef<A>>().unwrap().upgrade() else {
+        // Defensive downcast: never panic here — the Forward handler is the
+        // single most-used recovery path (every env.tell / env.ask /
+        // env.forward goes through it). A panic kills the Registry and
+        // cascades to every Uniderp via ActorGone. Treat a mismatch as
+        // "actor not found" so the caller's normal not-found path runs.
+        let Some(weak_aref) = aref.downcast_ref::<WeakActorRef<A>>() else {
+            tracing::warn!(
+                actor_ty = %type_name::<A>(),
+                "registry: Forward downcast failed on stored entry; \
+                 treating as not found"
+            );
+            return RegistryForward::NotFound(msg.message);
+        };
+
+        let Some(aref) = weak_aref.upgrade() else {
             tracing::trace!("actor dead");
             return RegistryForward::ActorDead(msg.message);
         };
@@ -392,5 +457,192 @@ where
         let result = ctx.try_forward(&aref, msg.message);
 
         RegistryForward::Forwarded(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Panic-hardening tests for the Registry actor.
+    //!
+    //! These tests verify that the recovery flow's register/unregister/lookup
+    //! patterns NEVER panic the Registry actor, even under adversarial
+    //! conditions (missing entries, repeated unregister, lookup of a name
+    //! registered under a different type). A Registry panic cascades to
+    //! every Uniderp via ActorGone and silences every recovery path — so
+    //! the tests must stay green for the DERP recovery architecture to work.
+    //!
+    //! See `DERP-RECOVERY-DESIGN.md` and the coordinator's cadfddc Gate 2
+    //! post-mortem for the specific regression that motivated this hardening.
+
+    use std::time::Duration;
+
+    use kameo::actor::Spawn as _;
+
+    use super::{Lookup, Register, Unregister};
+    use crate::env::Env;
+
+    /// Two distinct actor types so we can exercise cross-type lookups
+    /// (register as A, look up as B — must not panic, must return None).
+    struct FakeActorA;
+    impl kameo::Actor for FakeActorA {
+        type Args = ();
+        type Error = crate::Error;
+        async fn on_start(_: (), _: kameo::actor::ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(Self)
+        }
+    }
+
+    struct FakeActorB;
+    impl kameo::Actor for FakeActorB {
+        type Args = ();
+        type Error = crate::Error;
+        async fn on_start(_: (), _: kameo::actor::ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(Self)
+        }
+    }
+
+    /// Register an actor, then unregister it. The registry must survive both
+    /// operations without panic.
+    #[tokio::test]
+    async fn register_and_unregister_does_not_panic() {
+        let env = Env::new(ts_keys::NodeState::generate());
+        let registry = env.registry.clone();
+
+        let actor = FakeActorA::spawn(());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Register under a named key.
+        let prev: Option<kameo::actor::WeakActorRef<FakeActorA>> = registry
+            .ask(Register::<FakeActorA>::new(Some("test-name".into()), &actor))
+            .await
+            .unwrap();
+        assert!(prev.is_none(), "first register should have no previous");
+
+        // Unregister the same name.
+        let unreg: Option<kameo::actor::WeakActorRef<FakeActorA>> = registry
+            .ask(Unregister::<FakeActorA>::new(Some("test-name".into())))
+            .await
+            .unwrap();
+        assert!(unreg.is_some(), "unregister should return the previous entry");
+
+        // Registry must still be alive.
+        assert!(registry.is_alive(), "registry survived register+unregister");
+    }
+
+    /// Unregistering a name that was never registered must NOT panic —
+    /// returns None cleanly.
+    #[tokio::test]
+    async fn unregister_nonexistent_does_not_panic() {
+        let env = Env::new(ts_keys::NodeState::generate());
+        let registry = env.registry.clone();
+
+        let result: Option<kameo::actor::WeakActorRef<FakeActorA>> = registry
+            .ask(Unregister::<FakeActorA>::new(Some("never-registered".into())))
+            .await
+            .unwrap();
+        assert!(result.is_none(), "unregister of nonexistent returns None");
+        assert!(registry.is_alive(), "registry survived nonexistent unregister");
+    }
+
+    /// Looking up a name registered under a DIFFERENT actor type must NOT
+    /// panic — returns None cleanly. The Id includes TypeId, so the two
+    /// registrations use different keys, but this test verifies the Lookup
+    /// handler's defensive downcast path doesn't panic if somehow a
+    /// mismatched entry is encountered.
+    #[tokio::test]
+    async fn cross_type_lookup_does_not_panic() {
+        let env = Env::new(ts_keys::NodeState::generate());
+        let registry = env.registry.clone();
+
+        let actor_a = FakeActorA::spawn(());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Register A under "shared-name".
+        registry
+            .ask(Register::<FakeActorA>::new(Some("shared-name".into()), &actor_a))
+            .await
+            .unwrap();
+
+        // Look up "shared-name" as FakeActorB — different TypeId, so this
+        // is a different key. Returns None without panic.
+        let result = registry
+            .ask(Lookup::<FakeActorB>::new(Some("shared-name".into())))
+            .await
+            .unwrap();
+        // The DelegatedReply resolves to None: no FakeActorB under this name.
+        assert!(result.is_none(), "cross-type lookup returns None");
+
+        assert!(
+            registry.is_alive(),
+            "registry survived a cross-type lookup"
+        );
+    }
+
+    /// Re-registering the same name (same type) returns the previous entry.
+    /// The downcast must not panic on the second register.
+    #[tokio::test]
+    async fn reregister_same_name_returns_previous_without_panic() {
+        let env = Env::new(ts_keys::NodeState::generate());
+        let registry = env.registry.clone();
+
+        let actor_a1 = FakeActorA::spawn(());
+        let actor_a2 = FakeActorA::spawn(());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // First register.
+        let prev1 = registry
+            .ask(Register::<FakeActorA>::new(Some("dup".into()), &actor_a1))
+            .await
+            .unwrap();
+        assert!(prev1.is_none());
+
+        // Second register under the same name — returns the previous entry.
+        let prev2 = registry
+            .ask(Register::<FakeActorA>::new(Some("dup".into()), &actor_a2))
+            .await
+            .unwrap();
+        assert!(
+            prev2.is_some(),
+            "second register returns the previous entry"
+        );
+
+        assert!(registry.is_alive(), "registry survived re-register");
+    }
+
+    /// Repeated unregister calls (more than the number of registered actors)
+    /// must not panic. The recovery flow's on_stop can fire multiple times
+    /// in edge cases (kameo's supervisor-restart path), and each calls
+    /// unregister.
+    #[tokio::test]
+    async fn repeated_unregister_does_not_panic() {
+        let env = Env::new(ts_keys::NodeState::generate());
+        let registry = env.registry.clone();
+
+        let actor = FakeActorA::spawn(());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        registry
+            .ask(Register::<FakeActorA>::new(Some("rep".into()), &actor))
+            .await
+            .unwrap();
+
+        // Unregister 5 times — only the first returns Some, the rest return
+        // None, none panic.
+        for i in 0..5u32 {
+            let result: Option<kameo::actor::WeakActorRef<FakeActorA>> = registry
+                .ask(Unregister::<FakeActorA>::new(Some("rep".into())))
+                .await
+                .unwrap();
+            if i == 0 {
+                assert!(result.is_some(), "first unregister returns the entry");
+            } else {
+                assert!(result.is_none(), "subsequent unregister #{} returns None", i);
+            }
+        }
+
+        assert!(
+            registry.is_alive(),
+            "registry survived 5 repeated unregister calls"
+        );
     }
 }

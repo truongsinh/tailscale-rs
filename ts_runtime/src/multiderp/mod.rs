@@ -127,13 +127,26 @@ impl Multiderp {
         // outage is never respawned (its stale registry entry fools
         // ensure_region into thinking it's alive), and the DERP layer
         // never recovers.
-        let alive = self
-            .env
-            .lookup_opt::<Uniderp>(Some(Uniderp::name(id)))
-            .await
-            .unwrap()
-            .and_then(|weak| weak.upgrade())
-            .is_some();
+        //
+        // Best-effort lookup: if the Registry itself is dead/dying (e.g.,
+        // due to a prior panic that the registry.rs hardening was meant
+        // to prevent), the ask returns Err. Treat that as "not alive" so
+        // the respawn path fires — the alternative (unwrap → panic) would
+        // cascade the failure into the Multiderp actor, taking down the
+        // supervisor for every region.
+        let alive = match self.env.lookup_opt::<Uniderp>(Some(Uniderp::name(id))).await {
+            Ok(Some(weak)) => weak.upgrade().is_some(),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    region_id = %id,
+                    error = %e,
+                    "ensure_region: registry lookup failed; treating as 'not alive' \
+                     (will attempt respawn so the region recovers when the registry returns)"
+                );
+                false
+            }
+        };
         if alive {
             return;
         }
@@ -199,7 +212,8 @@ impl Multiderp {
             return;
         }
 
-        self.env
+        if let Err(e) = self
+            .env
             .scheduler
             .ask(SetTimeout::new(
                 slf.downgrade(),
@@ -207,16 +221,31 @@ impl Multiderp {
                 DebouncedPublish,
             ))
             .await
-            .unwrap();
+        {
+            tracing::warn!(
+                error = %e,
+                "debounce_map_publish: scheduler ask failed; skipping this debounce cycle \
+                 (recovery continues — the next StateUpdate will retry)"
+            );
+            return;
+        }
 
         self.debounce_state.publish_enqueued = true;
     }
 
     async fn do_map_publish(&mut self) {
-        self.env
+        if let Err(e) = self
+            .env
             .publish(DerpTransportMap(Arc::new(self.region_map.clone())))
             .await
-            .unwrap();
+        {
+            tracing::warn!(
+                error = %e,
+                "do_map_publish: bus publish failed; skipping this publish cycle \
+                 (recovery continues — the next debounce/StateUpdate will retry)"
+            );
+            return;
+        }
 
         self.debounce_state.last_publish = Some(Instant::now());
     }
