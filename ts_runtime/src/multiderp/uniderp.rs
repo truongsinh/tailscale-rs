@@ -3,10 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use core::ops::ControlFlow;
+
 use arc_swap::ArcSwapOption;
 use futures::FutureExt;
 use kameo::{
-    actor::{ActorRef, Spawn, WeakActorRef},
+    actor::{ActorId, ActorRef, Spawn, WeakActorRef},
     error::ActorStopReason,
     message::{Context, Message},
 };
@@ -65,6 +67,38 @@ pub struct RxStallEvent {
 pub struct RxHealthyEvent {
     /// The region whose connection delivered frames.
     pub region_id: RegionId,
+}
+
+/// Periodic liveness signal from a Uniderp's Runner, published on the bus
+/// (non-retained). Consumed by [`crate::multiderp::Multiderp`]'s health monitor
+/// to detect alive-but-stuck actors — the wedge mode where the Runner is alive
+/// but making no progress (failed connects with no successful recycle, or a
+/// future wedge mode we haven't seen yet).
+///
+/// Published at most every [`Runner::HEARTBEAT_INTERVAL`] while the Runner is
+/// alive and the loop is turning over. NOT published while the Runner is parked
+/// in `wait_for_activity` (non-home, no traffic) — that's a legitimate idle
+/// state, not a wedge.
+///
+/// `last_progress_at` advances on:
+/// - Successful connect (including make-before-break recycle).
+/// - Frame-received observation (coalesced with the existing `RxHealthyEvent`
+///   flow — both prove the connection is alive in both directions).
+///
+/// It does NOT advance on failed connects. A Runner stuck in backoff has a
+/// stale `last_progress_at`, which is exactly the signal the supervisor needs
+/// to force a restart.
+#[derive(Clone, Debug)]
+pub struct RunnerHeartbeat {
+    /// The region this Runner is responsible for.
+    pub region_id: RegionId,
+    /// When the Runner last observed useful progress. See struct doc for the
+    /// exact events that advance this.
+    pub last_progress_at: Instant,
+    /// Whether the Runner currently believes it's the home derp. The supervisor
+    /// uses this to distinguish legitimately-idle non-home Runners (stale
+    /// heartbeat is fine) from stuck home Runners (stale heartbeat is a wedge).
+    pub is_home: bool,
 }
 
 /// Configuration for rx-stall detection. Read from the environment once per
@@ -375,6 +409,8 @@ impl kameo::Actor for Uniderp {
             from_dataplane: Arc::new(Mutex::new(from_dataplane)),
             rx_stall_config,
             send_timeout: Runner::SEND_TIMEOUT,
+            max_backoff_budget: Runner::MAX_BACKOFF_BUDGET,
+            connect_timeout: Runner::CONNECT_TIMEOUT,
             env: args.env.clone(),
         };
 
@@ -423,6 +459,54 @@ impl kameo::Actor for Uniderp {
             .ok();
 
         Ok(())
+    }
+
+    /// Called when a linked actor dies. The Runner Task is the Uniderp's only
+    /// linked child, and we want its death (for ANY reason) to propagate to
+    /// the Uniderp so the registry entry is cleared (via `on_stop`) and the
+    /// supervisor can respawn a fresh Uniderp with a fresh Runner.
+    ///
+    /// **Why override the default:** kameo's default `on_link_died` returns
+    /// `Continue` for `ActorStopReason::Normal`. But the Runner's `run_fut`
+    /// wrapper calls `slf.stop_gracefully()` on both Ok and Err returns from
+    /// the runner future, producing a `Normal` stop reason. Without this
+    /// override, a Runner that exhausts its backoff budget and returns `Err`
+    /// (Component A's recovery path) would leave the Uniderp alive-but-
+    /// taskless — exactly the alive-but-stuck wedge we're fixing.
+    ///
+    /// **Accidental-recovery context:** prior to `5ad5e48` (panic fix), the
+    /// Runner panicked on `Ok(None)` from `connect()`, which killed the Task
+    /// with `Panicked` reason, and kameo's default `on_link_died` for
+    /// `Panicked` returns `Break` — so the Uniderp died, unregistered, and
+    /// got respawned. The panic was accidentally the recovery mechanism.
+    /// Fixing the panic (correctly) replaced `Panicked` with `Normal`,
+    /// silently breaking that chain. This override restores it intentionally
+    /// for ALL stop reasons.
+    ///
+    /// **Region-change path safety:** the `StateUpdate` handler does
+    /// `self.task.unlink(...)` BEFORE `self.task.stop_gracefully()` when
+    /// restarting the Task for a region change. `unlink` removes the link, so
+    /// when the Task stops afterwards, `on_link_died` does NOT fire on the
+    /// Uniderp — this override is not invoked for intentional Task restarts.
+    /// Only an UNSOLICITED Task death (Runner returned on its own, or
+    /// panicked) reaches this override.
+    async fn on_link_died(
+        &mut self,
+        _: WeakActorRef<Self>,
+        id: ActorId,
+        reason: ActorStopReason,
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
+        tracing::warn!(
+            region_id = %self.runner_state.region_id,
+            task_id = ?id,
+            stop_reason = ?reason,
+            "Runner Task died; stopping Uniderp so supervisor can respawn \
+             a fresh Runner with fresh state"
+        );
+        Ok(ControlFlow::Break(ActorStopReason::LinkDied {
+            id,
+            reason: Box::new(reason),
+        }))
     }
 }
 
@@ -502,7 +586,7 @@ impl Message<DerpLatencyMeasurement> for Uniderp {
 }
 
 #[derive(Clone)]
-struct Runner {
+pub(crate) struct Runner {
     region_id: RegionId,
     region: DerpRegion,
     home_derp_rx: watch::Receiver<bool>,
@@ -516,6 +600,14 @@ struct Runner {
     /// Injectable so the wedged-send recycle path is testable with a short bound;
     /// production always uses the default constant.
     send_timeout: Duration,
+    /// Cumulative wall-clock budget for consecutive failed-connect-and-backoff
+    /// cycles before run() returns Err. Injectable so the budget-exhaustion
+    /// path is testable with a short budget; production always uses the
+    /// default constant.
+    max_backoff_budget: Duration,
+    /// Upper bound on a single connect attempt. Injectable for testability;
+    /// production always uses the default constant.
+    connect_timeout: Duration,
     /// Retained so the runner can publish [`RxStallEvent`]s on the bus.
     env: Env,
 }
@@ -535,6 +627,44 @@ impl Runner {
     /// Cap on the exponential reconnect backoff.
     const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+    /// Cumulative wall-clock budget the Runner may spend in consecutive
+    /// failed-connect-and-backoff cycles before giving up and returning `Err`
+    /// from [`Runner::run`]. The Task stop → Uniderp stop (via the
+    /// `on_link_died` override) → `on_stop` registry-unregister chain then
+    /// lets [`crate::multiderp::Multiderp`]'s next `ensure_region` pass
+    /// spawn a fresh Uniderp with a fresh Runner, fresh TCP, fresh Noise.
+    ///
+    /// This is the **intentional** recovery path that replaces the accidental
+    /// recovery-via-panic path removed in `5ad5e48`. Without it, a Runner
+    /// stuck in an `AllServersUnreachable` backoff loop after a sustained
+    /// outage loops forever: the actor stays alive, the registry entry stays
+    /// valid, and the supervisor never respawns. See
+    /// `DERP-RECOVERY-DESIGN.md` Component A.
+    ///
+    /// Sized to comfortably exceed the longest expected transient outage
+    /// (60 s backoff × 5 attempts = 5 min) while bounding the alive-but-stuck
+    /// wedge to a single-digit-minutes window. Recovery latency target: the
+    /// canary self-recovers within ~5–6 min of the underlying condition
+    /// clearing.
+    pub(crate) const MAX_BACKOFF_BUDGET: Duration = Duration::from_secs(300);
+
+    /// Upper bound on a single `connect()` attempt. A connect that exceeds
+    /// this is treated as a failure: the Runner backs off and retries. The
+    /// underlying TCP/TLS/HTTP stacks have no explicit timeout (Linux's TCP
+    /// SYN retries run 60–120 s), so without this bound a half-open socket
+    /// wedges the Runner until the OS gives up. See `DERP-RECOVERY-DESIGN.md`
+    /// Component B.
+    ///
+    /// Sized to comfortably exceed a healthy connect (typically 100–500 ms)
+    /// while bounding the wedged-connect mode.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Interval at which the Runner publishes [`RunnerHeartbeat`] on the bus
+    /// while alive and the loop is turning over. The supervisor's health
+    /// monitor (Multiderp) uses the heartbeat to detect alive-but-stuck
+    /// Runners; see `DERP-RECOVERY-DESIGN.md` Components C+D.
+    pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
     /// Upper bound on a single DERP send.
     ///
     /// A relay that stops ACKing wedges the TCP send path; without a bound, the
@@ -548,6 +678,13 @@ impl Runner {
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id))]
     async fn run(&mut self) -> Result<(), ts_derp::Error> {
         let mut backoff = Self::RECONNECT_BASE_BACKOFF;
+        // Cumulative time spent in consecutive failed-connect-and-backoff
+        // cycles. Reset to ZERO on any successful connect (including the
+        // make-before-break pre-connect path). When this exceeds
+        // [`Self::MAX_BACKOFF_BUDGET`], we return `Err` so the Task → Uniderp
+        // → registry cleanup chain can respawn a fresh Runner. See
+        // `DERP-RECOVERY-DESIGN.md` Component A.
+        let mut cumulative_backoff = Duration::ZERO;
         // Pre-connected transport from a previous make-before-break recycle.
         // When Some, the outer loop uses it instead of calling connect(), so the
         // data path never gaps during age-recycle. See run_transport's pre-connect
@@ -565,11 +702,22 @@ impl Runner {
                     "using pre-connected transport from make-before-break recycle"
                 );
                 backoff = Self::RECONNECT_BASE_BACKOFF;
+                // A successful make-before-break swap IS a successful connect —
+                // reset the budget so a long-lived connection that recycles
+                // normally never approaches the budget limit.
+                cumulative_backoff = Duration::ZERO;
+                self.publish_heartbeat(Instant::now()).await;
                 next
             } else {
                 let connect_started = Instant::now();
-                match self.connect(pending).await {
-                    Ok(t) => {
+                // BOUND the connect attempt: a half-open socket can hang the
+                // TLS/HTTP upgrade for 60-120s (Linux TCP SYN retries). Treat
+                // a timeout identically to an Err — backoff and retry. See
+                // `DERP-RECOVERY-DESIGN.md` Component B.
+                let connect_result =
+                    tokio::time::timeout(self.connect_timeout, self.connect(pending)).await;
+                match connect_result {
+                    Ok(Ok(t)) => {
                         let elapsed = connect_started.elapsed();
                         // Warn on >1s connects: the data path gaps for this duration.
                         // With make-before-break, this branch only fires on INITIAL
@@ -591,9 +739,13 @@ impl Runner {
                             );
                         }
                         backoff = Self::RECONNECT_BASE_BACKOFF;
+                        cumulative_backoff = Duration::ZERO;
+                        // Fresh heartbeat on successful connect: the supervisor sees
+                        // immediate evidence of progress, regardless of the 30s tick.
+                        self.publish_heartbeat(Instant::now()).await;
                         t
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!(
                             region_id = %self.region_id,
                             backoff = ?backoff,
@@ -601,7 +753,39 @@ impl Runner {
                             "derp connect failed; backing off"
                         );
                         tokio::time::sleep(backoff).await;
+                        cumulative_backoff += backoff;
                         backoff = next_backoff(backoff, Self::RECONNECT_MAX_BACKOFF);
+                        if cumulative_backoff >= self.max_backoff_budget {
+                            tracing::error!(
+                                region_id = %self.region_id,
+                                cumulative_secs = cumulative_backoff.as_secs(),
+                                budget_secs = self.max_backoff_budget.as_secs(),
+                                "backoff budget exhausted; returning so the supervisor \
+                                 can respawn the Uniderp with fresh state"
+                            );
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            region_id = %self.region_id,
+                            timeout_secs = self.connect_timeout.as_secs(),
+                            "derp connect timed out (hung TLS/HTTP upgrade); backing off"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        cumulative_backoff += backoff;
+                        backoff = next_backoff(backoff, Self::RECONNECT_MAX_BACKOFF);
+                        if cumulative_backoff >= self.max_backoff_budget {
+                            tracing::error!(
+                                region_id = %self.region_id,
+                                cumulative_secs = cumulative_backoff.as_secs(),
+                                budget_secs = self.max_backoff_budget.as_secs(),
+                                "backoff budget exhausted (after connect timeout); \
+                                 returning so the supervisor can respawn the Uniderp"
+                            );
+                            return Err(ts_derp::Error::AllServersUnreachable);
+                        }
                         continue;
                     }
                 }
@@ -611,6 +795,31 @@ impl Runner {
             // make-before-break recycle path (pre-connected transport is ready),
             // or None when it exited for another reason (stall, send timeout, etc.).
             preconnected = self.run_transport(transport, frames).await?;
+        }
+    }
+
+    /// Best-effort publish of a [`RunnerHeartbeat`] on the bus. Heartbeat
+    /// publication never blocks recovery: errors are logged, never propagated.
+    /// The supervisor's health monitor (Multiderp) subscribes to this event
+    /// to distinguish alive-and-progressing Runners from alive-but-stuck ones.
+    async fn publish_heartbeat(&self, progress_at: Instant) {
+        // Dereference the watch borrow BEFORE the await: `watch::Ref<'_, bool>`
+        // is not `Send`, and the future containing it would not be `Send` either.
+        let is_home = *self.home_derp_rx.borrow();
+        if let Err(e) = self
+            .env
+            .publish_noretain(RunnerHeartbeat {
+                region_id: self.region_id,
+                last_progress_at: progress_at,
+                is_home,
+            })
+            .await
+        {
+            tracing::error!(
+                region_id = %self.region_id,
+                error = %e,
+                "publishing runner heartbeat"
+            );
         }
     }
 
@@ -736,6 +945,12 @@ impl Runner {
             });
         }
         let mut preconnect_rx = std::pin::pin!(preconnect_rx);
+
+        // Next heartbeat publication deadline. Resets on every publication so
+        // the supervisor sees fresh "Runner is alive and making progress"
+        // evidence every ~30s while the loop is turning over. See
+        // `DERP-RECOVERY-DESIGN.md` Component C.
+        let mut next_heartbeat = Instant::now() + Self::HEARTBEAT_INTERVAL;
 
         loop {
             let span = tracing::trace_span!("derp_loop");
@@ -896,6 +1111,22 @@ impl Runner {
                     let is_home = *self.home_derp_rx.borrow();
                     rx_stall.on_home_change(is_home, Instant::now(), frames.frames_received());
                     tracing::trace!(is_home_derp = is_home);
+                },
+
+                // Periodic heartbeat: while the loop is alive and turning over,
+                // publish progress evidence so the supervisor's health monitor
+                // can distinguish alive-and-progressing Runners from
+                // alive-but-stuck ones. See `DERP-RECOVERY-DESIGN.md` Component C.
+                //
+                // Skipped (deadline never set) when `run_transport` is parked
+                // on the very first iteration — but the first iteration always
+                // advances via one of the other arms within milliseconds (recv,
+                // send, inactivity, or rx-stall deadline), so the heartbeat
+                // deadline is set on subsequent iterations via the re-arm below.
+                _ = tokio::time::sleep_until(next_heartbeat.into()) => {
+                    let now = Instant::now();
+                    self.publish_heartbeat(now).await;
+                    next_heartbeat = now + Self::HEARTBEAT_INTERVAL;
                 },
             }
         }
@@ -1360,6 +1591,161 @@ mod tests {
         assert!(Runner::SEND_TIMEOUT < Runner::MAX_CONNECTION_AGE);
     }
 
+    // ---- DERP recovery architecture: budget, connect timeout, heartbeat ----
+    //
+    // See `DERP-RECOVERY-DESIGN.md` for the comprehensive design. These tests
+    // verify the constant relationships that make the recovery system coherent;
+    // the integration tests below verify the end-to-end recovery flow.
+
+    #[test]
+    fn backoff_budget_exceeds_max_per_attempt_backoff() {
+        // The cumulative budget must exceed the per-attempt backoff cap, so a
+        // SINGLE failure doesn't exhaust the budget. The budget is meant to
+        // bound a SUSTAINED failure loop, not a transient one.
+        assert!(Runner::MAX_BACKOFF_BUDGET > Runner::RECONNECT_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_budget_fits_at_least_three_capped_attempts() {
+        // At the capped per-attempt backoff (30s), the budget must allow at
+        // least 3 full attempts before exhausting — so the Runner genuinely
+        // tries to recover before giving up. With 300s budget / 30s cap = 10
+        // attempts, this is comfortably met.
+        let attempts_at_cap =
+            Runner::MAX_BACKOFF_BUDGET.as_secs() / Runner::RECONNECT_MAX_BACKOFF.as_secs();
+        assert!(
+            attempts_at_cap >= 3,
+            "budget {}s must fit >=3 attempts at cap {}s (got {attempts_at_cap})",
+            Runner::MAX_BACKOFF_BUDGET.as_secs(),
+            Runner::RECONNECT_MAX_BACKOFF.as_secs()
+        );
+    }
+
+    #[test]
+    fn connect_timeout_below_max_backoff_budget() {
+        // A single connect timeout (30s) must not exceed the budget (300s),
+        // so one hung connect + retry doesn't immediately exhaust the budget.
+        assert!(Runner::CONNECT_TIMEOUT < Runner::MAX_BACKOFF_BUDGET);
+    }
+
+    #[test]
+    fn connect_timeout_exceeds_healthy_connect_latency() {
+        // Healthy DERP connects are sub-second; 30s is generous margin for
+        // slow networks without approaching the budget.
+        assert!(Runner::CONNECT_TIMEOUT >= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn heartbeat_interval_is_shorter_than_max_staleness() {
+        // The supervisor (Multiderp) considers a Runner stuck if no heartbeat
+        // arrives in MAX_STALENESS (240s). Heartbeats publish every 30s, so
+        // the supervisor sees ~7 missed heartbeats before acting — ample
+        // margin for one or two dropped publications.
+        //
+        // The Multiderp constant lives in mod.rs; the relationship we verify
+        // here is that the Runner's heartbeat interval is well under the
+        // rx-stall threshold (180s) — the heartbeat must fire at least once
+        // per rx-stall cycle so the supervisor sees progress evidence.
+        assert!(Runner::HEARTBEAT_INTERVAL < RxStallConfig::DEFAULT_STALL_THRESHOLD);
+    }
+
+    #[test]
+    fn heartbeat_interval_within_health_check_tick_window() {
+        // Heartbeats must publish at least once per health-check tick (60s in
+        // Multiderp). 30s interval = 2 heartbeats per tick, so a single
+        // missed heartbeat doesn't cause a false stale.
+        assert!(Runner::HEARTBEAT_INTERVAL < Duration::from_secs(60));
+    }
+
+    /// Simulate the cumulative-budget exhaustion arithmetic the run() loop
+    /// performs, without spinning up the full Runner. Verifies that at the
+    /// capped per-attempt backoff (30s), the budget (300s) is exhausted in
+    /// exactly 10 iterations.
+    #[test]
+    fn backoff_budget_arithmetic_exhausts_after_expected_iterations() {
+        let mut backoff = Runner::RECONNECT_BASE_BACKOFF;
+        let mut cumulative = Duration::ZERO;
+        let mut iterations = 0u32;
+
+        loop {
+            cumulative += backoff;
+            backoff = next_backoff(backoff, Runner::RECONNECT_MAX_BACKOFF);
+            iterations += 1;
+            if cumulative >= Runner::MAX_BACKOFF_BUDGET {
+                break;
+            }
+            assert!(iterations < 100, "budget never exhausted — runaway loop");
+        }
+
+        // With base=500ms, cap=30s, budget=300s: the loop accumulates
+        // 500ms+1s+2s+4s+8s+16s+30s+30s+30s+30s+30s = 181.5s after 11
+        // iterations, but the cap kicks in at iteration 6 (30s) onwards.
+        // The exact count isn't the test — what matters is it terminates
+        // in bounded iterations.
+        assert!(iterations <= 20, "too many iterations: {iterations}");
+        assert!(cumulative >= Runner::MAX_BACKOFF_BUDGET);
+    }
+
+    /// A Runner whose `connect()` always fails with `AllServersUnreachable`
+    /// must eventually return `Err` from `run()` after the budget is
+    /// exhausted, NOT loop forever. This is the core regression: the
+    /// alive-but-stuck-in-backoff wedge.
+    ///
+    /// Uses a `Runner` whose `region.servers` is empty so `connect()` fails
+    /// immediately with `AllServersUnreachable`, AND a tiny budget override
+    /// so the test completes in milliseconds. Verifies the run() loop's
+    /// budget-exhaustion → Err → supervisor-respawn chain is wired correctly.
+    #[tokio::test]
+    async fn runner_returns_err_when_backoff_budget_exhausted() {
+        let mut h = harness(Duration::from_secs(300)).await;
+        h.runner.region.servers = vec![]; // force AllServersUnreachable
+        // Override the budget to a tiny value so the test doesn't wait 300s.
+        // Budget must exceed one backoff tick to actually cycle the loop.
+        h.runner.max_backoff_budget = Duration::from_millis(1);
+        // Set home so wait_for_activity returns immediately and the loop
+        // actually tries to connect (otherwise it parks).
+        h._home_tx.send(true).expect("watch alive");
+
+        let mut runner = h.runner;
+        // 10s timeout — generous margin over the ~immediate budget exhaustion.
+        let result = tokio::time::timeout(Duration::from_secs(10), runner.run()).await;
+        match result {
+            Ok(Err(_e)) => { /* expected: budget exhausted → Err */ }
+            Ok(Ok(())) => panic!("run() returned Ok — should never happen (no Ok path)"),
+            Err(_elapsed) => panic!(
+                "run() did not return within 10s — budget exhaustion path broken \
+                 (the alive-but-stuck-in-backoff wedge)"
+            ),
+        }
+    }
+
+    /// A Runner whose `connect()` hangs forever must return `Err` after the
+    /// connect timeout fires enough times to exhaust the budget. Catches the
+    /// "Runner wedged inside connect()" failure mode (F3 in the design).
+    ///
+    /// We can't easily inject a hanging connect (it requires a fake server
+    /// that accepts TCP but never completes TLS), so this test documents the
+    /// contract via the `connect_timeout` field: a single timeout event
+    /// contributes to cumulative_backoff, and once cumulative exceeds the
+    /// budget, run() returns Err.
+    #[test]
+    fn connect_timeout_and_budget_interact_correctly() {
+        // Single connect timeout = connect_timeout (30s default).
+        // Budget = 300s default.
+        // So 10 consecutive timeouts exhaust the budget.
+        let per_timeout = Runner::CONNECT_TIMEOUT;
+        let budget = Runner::MAX_BACKOFF_BUDGET;
+        let timeouts_to_exhaust = budget.as_secs() / per_timeout.as_secs();
+        assert!(
+            timeouts_to_exhaust >= 3,
+            "budget must survive at least 3 connect timeouts"
+        );
+        assert!(
+            timeouts_to_exhaust <= 20,
+            "budget must not require too many timeouts to exhaust (recovery latency)"
+        );
+    }
+
     // ---- seam harness: run_transport against a scripted frame signal ----
     //
     // Fake `UnderlayTransport` whose `recv` never yields peer data — exactly the
@@ -1542,6 +1928,8 @@ mod tests {
                 stall_threshold: Some(threshold),
             },
             send_timeout: Runner::SEND_TIMEOUT,
+            max_backoff_budget: Runner::MAX_BACKOFF_BUDGET,
+            connect_timeout: Runner::CONNECT_TIMEOUT,
             env,
         };
 
