@@ -186,7 +186,21 @@ impl ControlRunner {
         )
         .await
         {
-            Ok((_client, stream)) => {
+            Ok((client, stream)) => {
+                // Store the new client BEFORE attaching the stream so its internal
+                // run() task (which publishes StateUpdates onto the broadcast channel
+                // the stream reads from) stays alive for the lifetime of the actor.
+                // Binding to `_client` (the prior code) dropped the client at the end
+                // of this block, which dropped its `_tasks: JoinSet`, which aborted
+                // the publish task — so the freshly-attached stream saw an empty
+                // broadcast channel (all senders gone) and immediately returned
+                // `None`, which surfaced as `StreamMessage::Finished` in the same
+                // `handle_message` turn. The off-tailnet watchdog's ForceReconnect
+                // then re-fired on its next tick, hit the same drop, and the control
+                // plane never recovered. Replacing the old client (which drops it
+                // and aborts its now-orphaned publish task) is the symmetric
+                // counterpart to `on_start`'s `client` storage.
+                self.client = client;
                 let handle = slf.attach_stream(stream.boxed(), (), ());
                 self.stream_handle = Some(handle);
                 self.earliest_reconnect_at = Some(now + RECONNECT_BACKOFF);

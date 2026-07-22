@@ -7,7 +7,7 @@
 //! Sessions are pipe-backed: no pty is allocated, and `pty-req` is refused. See the
 //! module docs on [`ShellServer`] for why.
 
-use std::{net::IpAddr, path::{Path, PathBuf}, process::Stdio, sync::Arc};
+use std::{net::IpAddr, path::{Path, PathBuf}, process::Stdio, sync::Arc, time::Duration};
 
 use clap::Parser;
 use russh::{
@@ -144,12 +144,33 @@ impl Handler for ShellServer {
 
     #[tracing::instrument(skip_all, fields(remote = %self.remote))]
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
-        let peer = self
-            .dev
-            .peer_by_tailnet_ip(self.remote.ip())
-            .await
-            .ok()
-            .flatten();
+        // Bound the peer-info lookup. `peer_by_tailnet_ip` asks the PeerTracker
+        // actor, which queues the request if no `StateUpdate` has ever arrived
+        // (control stream wedged, brand-new boot, etc.). Without a timeout the
+        // auth_none future — and with it the SSH session — hangs until the
+        // control plane recovers, holding a tokio worker for the duration. The
+        // SSH layer's own `inactivity_timeout` (default 600 s) eventually GCs
+        // the session, but by then dozens of pending auths can pile up on a
+        // reachable box and starve the runtime — a Form B wedge trigger.
+        //
+        // The lookup is purely for logging (the session is accepted
+        // unconditionally below), so a timeout that returns `None` is safe.
+        let peer = match tokio::time::timeout(
+            Duration::from_secs(2),
+            self.dev.peer_by_tailnet_ip(self.remote.ip()),
+        )
+        .await
+        {
+            Ok(Ok(opt)) => opt,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "peer_by_tailnet_ip failed; accepting anyway");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("peer_by_tailnet_ip timed out; accepting anyway");
+                None
+            }
+        };
 
         tracing::info!(
             peer = peer.as_ref().map(|p| p.fqdn(false)),
@@ -551,6 +572,24 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
             // hard cap (russh logs a warning above 64 KiB but still honors the
             // value).
             maximum_packet_size: 1024 * 1024,
+            // Send an SSH keepalive every 30 s and drop the connection after 3
+            // unanswered keepalives (~90 s of silence). russh's default is no
+            // keepalive + a 600 s inactivity GC, which leaves a peer that
+            // silently disappears (TCP RST lost in transit, DERP relay drops
+            // the path, mobile client wanders between networks) holding a
+            // session slot + tokio worker for the full 10 minutes before the
+            // GC fires. A 30 s keepalive detects the dead peer in ~90 s and
+            // tears down the channel, freeing resources for the next
+            // connection. The cost — one tiny SSH_MSG_GLOBAL_REQUEST every
+            // 30 s per active session — is negligible on a DERP-relayed path
+            // that already exchanges keepalive frames at the WG layer.
+            keepalive_interval: Some(std::time::Duration::from_secs(30)),
+            // Disable russh's 600 s inactivity GC. The keepalive above
+            // subsumes its job (detecting dead peers) and does so faster;
+            // meanwhile the GC's "any inactivity" rule risks killing a
+            // legitimate session where the user stepped away (interactive
+            // shell on a phone, a slow `tail -f`, a paused debugger).
+            inactivity_timeout: None,
             ..Default::default()
         },
         (ipv4, args.listen_port).into(),
