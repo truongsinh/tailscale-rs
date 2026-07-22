@@ -411,6 +411,17 @@ impl kameo::Actor for Uniderp {
             )
             .await?;
 
+        // Unregister from the registry so `ensure_region` (and any other
+        // consumer of `lookup_opt`) sees this actor as gone and can respawn
+        // a fresh one on the next derp map update. Without this, the stale
+        // WeakActorRef entry stays in the registry and `ensure_region`'s
+        // `upgrade()` check is the only thing preventing a missed respawn.
+        let region_id = self.runner_state.region_id;
+        self.env
+            .unregister::<Uniderp>(Some(Self::name(region_id)))
+            .await
+            .ok();
+
         Ok(())
     }
 }

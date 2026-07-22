@@ -93,6 +93,24 @@ impl Env {
             .with_actor_info(&self.registry)
     }
 
+    /// Unregister an actor from the registry. Used in `on_stop` handlers so the
+    /// registry doesn't retain stale `WeakActorRef` entries that fool `lookup_opt`
+    /// into returning a dead actor as if it were alive.
+    pub async fn unregister<A>(
+        &self,
+        name: Option<SmolStr>,
+    ) -> Result<(), Error>
+    where
+        A: kameo::Actor + Any,
+    {
+        let _ = self
+            .registry
+            .ask(registry::Unregister::<A>::new(name))
+            .await
+            .with_actor_info(&self.registry)?;
+        Ok(())
+    }
+
     /// Look up an actor in the registry.
     pub async fn lookup_opt<A>(
         &self,

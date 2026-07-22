@@ -61,17 +61,25 @@ impl kameo::Actor for Multiderp {
 impl Multiderp {
     #[tracing::instrument(skip_all, fields(region_id = %id))]
     async fn ensure_region(&mut self, slf: &ActorRef<Self>, id: RegionId, region: &DerpRegion) {
-        if self
+        // Check for a LIVE Uniderp for this region. The registry retains
+        // WeakActorRef entries even after the actor dies — a dead weak ref
+        // must be treated as "not registered" so the region gets a fresh
+        // spawn. Without this check, a Uniderp that died during a DERP
+        // outage is never respawned (its stale registry entry fools
+        // ensure_region into thinking it's alive), and the DERP layer
+        // never recovers.
+        let alive = self
             .env
             .lookup_opt::<Uniderp>(Some(Uniderp::name(id)))
             .await
             .unwrap()
-            .is_some()
-        {
+            .and_then(|weak| weak.upgrade())
+            .is_some();
+        if alive {
             return;
         }
 
-        tracing::trace!("spawn new uniderp");
+        tracing::info!(region_id = %id, "spawning new uniderp (no live actor found)");
         Uniderp::supervise(
             slf,
             uniderp::Args {
