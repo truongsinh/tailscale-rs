@@ -544,8 +544,24 @@ impl Runner {
             // Reconnect with exponential backoff instead of letting a transient connect failure
             // tear down the whole region task (which previously died until a derp map update
             // respawned it). This keeps a region self-healing across brief derp outages.
+            //
+            // Time the connect so the data-path gap (the window in which no DERP frames can be
+            // delivered, including incoming SSH SYMs) is visible in logs. This is the gap the
+            // jitter on the recycle deadline above mitigates for the AGE-recycle trigger; other
+            // triggers (stall-recycle, watchdog-driven ForceRehome) go through the same path.
+            let connect_started = Instant::now();
             let (transport, frames) = match self.connect(pending).await {
                 Ok(transport) => {
+                    let elapsed = connect_started.elapsed();
+                    if elapsed >= Duration::from_secs(1) {
+                        tracing::warn!(
+                            region_id = %self.region_id,
+                            ?elapsed,
+                            "derp connect took more than 1s — data-path was interrupted for this window",
+                        );
+                    } else {
+                        tracing::debug!(region_id = %self.region_id, ?elapsed, "derp connection established");
+                    }
                     backoff = Self::RECONNECT_BASE_BACKOFF;
                     transport
                 }
@@ -661,7 +677,17 @@ impl Runner {
             // Recycle the connection once it is past the age floor. Returning `Ok` here drops the
             // transport and sends `run` back around to reconnect, replacing a potentially wedged
             // long-lived (home) socket with a fresh one.
-            let recycle_deadline = connected_at + Self::MAX_CONNECTION_AGE;
+            //
+            // The deadline carries the same per-node jitter as `rx_stall_config` so primary +
+            // backup (different node keys) don't close their home DERP connections in lockstep.
+            // A synchronous recycle gap is brief (1-5s for TCP+TLS+Noise to the relay), but it's
+            // the data-path gap that surfaces as SSH "banner exchange" timeouts when a probe
+            // arrives during the reconnect window. Staggering the recycles eliminates the
+            // per-channel simultaneous failure; the gap itself is addressed by a future
+            // make-before-break recycle (which needs a boxed transport — UnderlayTransport is
+            // not object-safe today).
+            let recycle_deadline =
+                connected_at + jittered(Self::MAX_CONNECTION_AGE, jitter_seed(&self.keys.public));
 
             // Earliest instant an rx-stall could be declared; `None` while the predicate
             // cannot trip (not home / detection disabled). The deadline branch below
