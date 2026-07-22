@@ -30,6 +30,7 @@ ts_derp.workspace = true
 ts_tunnel.workspace = true
 
 # Unconditionally required dependencies.
+arc-swap = "1"
 futures.workspace = true
 futures-util.workspace = true
 ipnet.workspace = true

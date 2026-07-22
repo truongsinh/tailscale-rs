@@ -1,8 +1,9 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwapOption;
 use futures::FutureExt;
 use kameo::{
     actor::{ActorRef, Spawn, WeakActorRef},
@@ -367,7 +368,7 @@ impl kameo::Actor for Uniderp {
         let runner = Runner {
             region_id: args.region_id,
             region: args.region,
-            peer_db: Arc::new(RwLock::new(None)),
+            peer_db: Arc::new(ArcSwapOption::new(None)),
             home_derp_rx,
             to_dataplane,
             keys: args.env.keys.node_keys.clone(),
@@ -464,8 +465,9 @@ impl Message<Arc<PeerState>> for Uniderp {
     type Reply = ();
 
     async fn handle(&mut self, msg: Arc<PeerState>, _ctx: &mut Context<Self, Self::Reply>) {
-        let mut db = self.runner_state.peer_db.write().unwrap();
-        *db = Some(msg.peers.clone());
+        self.runner_state
+            .peer_db
+            .store(Some(msg.peers.clone()));
     }
 }
 
@@ -495,7 +497,7 @@ struct Runner {
     home_derp_rx: watch::Receiver<bool>,
     to_dataplane: Tx<FromUnderlay>,
     from_dataplane: Arc<Mutex<Rx<ToUnderlay>>>,
-    peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
+    peer_db: Arc<ArcSwapOption<PeerDb>>,
     keys: NodeKeyPair,
     /// rx-stall detection thresholds (env-tunable, defaults conservative).
     rx_stall_config: RxStallConfig,
@@ -800,11 +802,11 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
     current.saturating_mul(2).min(max)
 }
 
-struct PeerDbLookup(Arc<RwLock<Option<Arc<PeerDb>>>>);
+struct PeerDbLookup(Arc<ArcSwapOption<PeerDb>>);
 
 impl ts_transport::PeerLookup<PeerId, NodePublicKey> for PeerDbLookup {
     fn lookup_key(&self, id: PeerId) -> Option<NodePublicKey> {
-        let db = self.0.read().unwrap();
+        let db = self.0.load();
         let db = db.as_ref()?;
 
         let (_, node) = db.get(&id)?;
@@ -814,7 +816,7 @@ impl ts_transport::PeerLookup<PeerId, NodePublicKey> for PeerDbLookup {
 
 impl ts_transport::PeerLookup<NodePublicKey, PeerId> for PeerDbLookup {
     fn lookup_key(&self, key: NodePublicKey) -> Option<PeerId> {
-        let db = self.0.read().unwrap();
+        let db = self.0.load();
         let db = db.as_ref()?;
 
         let (id, _) = db.get(&key)?;
@@ -1251,8 +1253,10 @@ mod tests {
 
     use std::{
         num::NonZeroU32,
-        sync::{Arc as StdArc, RwLock},
+        sync::Arc as StdArc,
     };
+
+    use arc_swap::ArcSwapOption;
 
     use kameo::actor::Spawn as _;
     use tokio::sync::{Mutex, mpsc, watch};
@@ -1417,7 +1421,7 @@ mod tests {
             home_derp_rx: home_rx,
             to_dataplane: to_dp_tx,
             from_dataplane: StdArc::new(Mutex::new(from_dp_rx)),
-            peer_db: StdArc::new(RwLock::new(None)),
+            peer_db: StdArc::new(ArcSwapOption::new(None)),
             keys: ts_keys::NodeState::generate().node_keys,
             rx_stall_config: RxStallConfig {
                 stall_threshold: Some(threshold),

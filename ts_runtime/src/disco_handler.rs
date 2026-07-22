@@ -31,8 +31,10 @@
 
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
+
+use arc_swap::ArcSwapOption;
 
 use crypto_box::aead::{AeadCore, OsRng};
 use kameo::{
@@ -56,7 +58,7 @@ use crate::{
 ///
 /// Mirrors the pattern in [`crate::multiderp::uniderp`]: `None` until the first
 /// [`PeerState`] update arrives.
-type SharedPeerDb = Arc<RwLock<Option<Arc<PeerDb>>>>;
+type SharedPeerDb = Arc<ArcSwapOption<PeerDb>>;
 
 /// Kameo actor that handles incoming Disco messages (Ping → Pong).
 ///
@@ -89,7 +91,7 @@ impl kameo::Actor for DiscoHandlerActor {
         tracing::trace!("disco handler actor started");
         Ok(Self {
             disco_keys,
-            peer_db: Arc::new(RwLock::new(None)),
+            peer_db: Arc::new(ArcSwapOption::new(None)),
             dataplane,
         })
     }
@@ -128,10 +130,9 @@ impl Message<Arc<PeerState>> for DiscoHandlerActor {
         state: Arc<PeerState>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) {
-        // Replace the entire peer_db snapshot on each update.
-        if let Ok(mut slot) = self.peer_db.write() {
-            *slot = Some(state.peers.clone());
-        }
+        // Replace the entire peer_db snapshot on each update (atomic swap — never
+        // blocks concurrent readers on the lookup path).
+        self.peer_db.store(Some(state.peers.clone()));
     }
 }
 
@@ -165,7 +166,7 @@ fn handle_plaintext(
 
     // Look up the sender's PeerId via their DiscoPublicKey.
     let peer_id = {
-        let guard = peer_db.read().map_err(|_| "peer_db lock poisoned")?;
+        let guard = peer_db.load();
         let Some(db) = guard.as_ref() else {
             // PeerDb not yet populated (no control-plane state update yet).
             return Ok(None);
